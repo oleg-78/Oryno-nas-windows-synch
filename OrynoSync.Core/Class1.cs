@@ -3,8 +3,8 @@ namespace OrynoSync.Core;
 public enum ItemType { File, Directory }
 public enum SyncItemState { Synced, Waiting, Uploading, Downloading, Conflict, Error, Ignored }
 public enum OperationType { CreateFile, UpdateFile, CreateDirectory, Move, Delete }
-public enum OperationState { Pending, InProgress, Completed, Failed }
-public enum EngineState { Offline, Connecting, Syncing, UpToDate, Paused, Error }
+public enum OperationState { Pending, InProgress, Completed, Failed, BlockedWaitingForServerCapability }
+public enum EngineState { Disconnected, Connecting, AuthenticationRequired, InitialInventory, Reconciling, OnlineIdle, SyncingMetadata, Offline, Paused, ProtocolError, Error, Syncing=SyncingMetadata, UpToDate=OnlineIdle }
 
 public sealed record LocalItem(string RelativePath, ItemType ItemType, long Size, DateTimeOffset Mtime, string? ContentHash = null, string? ServerItemId = null, long? ServerVersion = null, long? LastServerRevision = null, SyncItemState SyncState = SyncItemState.Synced, string? LastError = null);
 public sealed record PendingOperation(Guid OperationId, OperationType Type, string RelativePath, string? SecondaryPath = null, DateTimeOffset? CreatedAt = null, int AttemptCount = 0, DateTimeOffset? NextAttemptAt = null, OperationState State = OperationState.Pending, string? LastError = null);
@@ -22,6 +22,8 @@ public interface ISyncApi
 public interface ICredentialStore { Task SaveAsync(string account, string secret, CancellationToken ct = default); Task<string?> ReadAsync(string account, CancellationToken ct = default); Task DeleteAsync(string account, CancellationToken ct = default); }
 public interface IContentHasher { Task<string> ComputeAsync(string path, CancellationToken ct = default); }
 public interface IAtomicFileWriter { Task ReplaceAsync(string targetPath, Stream content, string expectedHash, CancellationToken ct = default); }
+public sealed class ServerCapabilityException(string capability) : Exception($"Server capability is unavailable: {capability}") { public string Capability { get; } = capability; }
+public sealed class SyncApiException(System.Net.HttpStatusCode status, string code, string message) : Exception(message) { public System.Net.HttpStatusCode Status { get; } = status; public string Code { get; } = code; }
 public static class PathRules
 {
     public static string NormalizeRelative(string path) => path.Replace('/', '\\').TrimStart('\\');

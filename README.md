@@ -10,7 +10,7 @@ dotnet test OrynoSync.Windows.sln
 dotnet run --project OrynoSync.App
 ```
 
-The first launch suggests `%USERPROFILE%\Oryno NAS` but does not create it. Use `Choose folder` to select an existing directory. The W.0 host uses the mock API in offline mode; the API is intentionally not connected to NAS.
+The first launch suggests `%USERPROFILE%\Oryno NAS` but does not create it. Use `Choose folder` to select an existing directory. Production UI uses `OrynoNasSyncApi`; the mock remains test-only. Enter the one-time device token issued by the S.1 browser/admin flow. The token is stored with Windows CurrentUser DPAPI and is never written to SQLite or logs.
 
 ## Projects
 
