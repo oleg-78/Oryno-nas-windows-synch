@@ -26,7 +26,7 @@ public partial class App : Application
             var path = capture["--capture=".Length..];
             Dispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.ApplicationIdle, new Action(async () =>
             {
-                await Task.Delay(1200); var window = (MainWindow)MainWindow; window.UpdateLayout();
+                await Task.Delay(1200); var window = (MainWindow)MainWindow; var page = e.Args.FirstOrDefault(x => x.StartsWith("--page=", StringComparison.OrdinalIgnoreCase))?["--page=".Length..]; if (Enum.TryParse<AppPage>(page, true, out var selectedPage)) window.SelectPage(selectedPage); window.UpdateLayout();
                 var bitmap = new RenderTargetBitmap((int)window.ActualWidth, (int)window.ActualHeight, 96, 96, PixelFormats.Pbgra32); bitmap.Render(window);
                 var encoder = new PngBitmapEncoder(); encoder.Frames.Add(BitmapFrame.Create(bitmap));
                 await using var stream = File.Create(path); encoder.Save(stream); window.Close();

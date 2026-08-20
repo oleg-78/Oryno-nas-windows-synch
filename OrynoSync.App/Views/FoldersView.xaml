@@ -1,0 +1,11 @@
+<UserControl x:Class="OrynoSync.App.Views.FoldersView" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+  <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled"><StackPanel>
+    <Border Background="{StaticResource PanelBrush}" BorderBrush="#303940" BorderThickness="1" CornerRadius="8" Padding="18" Margin="0,0,0,16"><StackPanel>
+      <TextBlock Text="LOCAL FOLDER" FontSize="10" Foreground="{StaticResource MutedBrush}"/><TextBlock Text="{Binding LocalFolder}" FontSize="16" TextTrimming="CharacterEllipsis" Margin="0,5,0,0"/><WrapPanel Margin="0,16,0,0"><Button Content="Change folder" Click="ChangeFolder_Click"/><Button Content="Open folder" Click="OpenFolder_Click" Margin="0"/></WrapPanel>
+    </StackPanel></Border>
+    <Border Background="{StaticResource PanelBrush}" BorderBrush="#303940" BorderThickness="1" CornerRadius="8" Padding="18" Margin="0,0,0,16"><StackPanel>
+      <TextBlock Text="ORYNO NAS SYNC ROOT" FontSize="10" Foreground="{StaticResource MutedBrush}"/><TextBlock Text="{Binding RootName}" FontSize="16" Margin="0,5,0,0" TextWrapping="Wrap"/><TextBlock Text="Local status" Foreground="{StaticResource MutedBrush}" Margin="0,18,0,0"/><TextBlock Text="{Binding LocalStatus}" Margin="0,4,0,0"/><TextBlock Text="{Binding Stats}" Foreground="{StaticResource MutedBrush}" Margin="0,8,0,0" TextWrapping="Wrap"/>
+    </StackPanel></Border>
+    <Border Background="{StaticResource PanelBrush}" BorderBrush="#303940" BorderThickness="1" CornerRadius="8" Padding="18"><StackPanel><TextBlock Text="SYNCHRONIZATION" FontSize="10" Foreground="{StaticResource MutedBrush}"/><TextBlock Text="Full local mirror" FontSize="16" Margin="0,5,0,0"/><TextBlock Text="All synced files are stored physically on this Windows device." Foreground="{StaticResource MutedBrush}" Margin="0,5,0,0" TextWrapping="Wrap"/></StackPanel></Border>
+  </StackPanel></ScrollViewer>
+</UserControl>
