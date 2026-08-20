@@ -33,12 +33,20 @@ public partial class MainWindow : Window
     private IReadOnlyList<SyncMapping> _mappings = [];
     private Guid? _selectedRootId;
     private AppPage _currentPage = AppPage.Activity;
+    private readonly ActivityView _activityView;
+    private readonly FoldersView _foldersView;
+    private readonly SettingsView _settingsView;
+    private string _lastConnectionVisual = "";
+    private string _lastSyncVisual = "";
 
     private string DatabasePath => Path.Combine(_appData, "oryno-sync.db");
 
     public MainWindow()
     {
         InitializeComponent();
+        _activityView = new ActivityView { DataContext = _activityVm };
+        _foldersView = new FoldersView { DataContext = _foldersVm };
+        _settingsView = new SettingsView { DataContext = _settingsVm };
         _store = new SqliteLocalStateStore(DatabasePath);
         _remoteStore = new RemoteStateStore(DatabasePath);
         _mappingStore = new SqliteSyncMappingStore(DatabasePath);
@@ -198,12 +206,17 @@ public partial class MainWindow : Window
 
     private async Task RefreshCountersAsync()
     {
-        var count = await _mappingStore.PendingCountAsync();
+        var summary = await _mappingStore.GetDashboardSummaryAsync();
+        var mappingSummaries = await _mappingStore.GetMappingSummariesAsync();
+        var errors = await _mappingStore.GetErrorsAsync(50);
         await Dispatcher.InvokeAsync(() =>
         {
-            _activityVm.QueueText = $"{count:N0} local changes waiting to sync";
-            _foldersVm.Stats = $"Pending changes: {count:N0}";
-            _settingsVm.QueueLength = count.ToString("N0");
+            _activityVm.ApplySummary(summary);
+            _activityVm.SetErrors(errors);
+            _foldersVm.ApplySummaries(mappingSummaries);
+            _foldersVm.Stats = $"{summary.IndexedFiles:N0} indexed · {summary.WaitingCount:N0} waiting · {summary.ErrorCount:N0} errors";
+            _settingsVm.QueueLength = summary.WaitingCount.ToString("N0");
+            SidebarSyncText.Text = summary.WaitingCount == 0 ? "Everything is up to date" : $"{summary.WaitingCount:N0} changes waiting safely";
         });
     }
 
@@ -238,10 +251,19 @@ public partial class MainWindow : Window
             ConnectionState.Checking => "Checking...",
             _ => "Disconnected"
         };
+        var visual = $"{label}|{message}";
+        if (visual == _lastConnectionVisual) return;
+        _lastConnectionVisual = visual;
+        var tone = state switch { ConnectionState.Connected or ConnectionState.ServerReachable => "Success", ConnectionState.Reconnecting or ConnectionState.Checking or ConnectionState.Connecting => "Warning", _ => "Error" };
         Dispatcher.BeginInvoke(() =>
         {
             SidebarStatus.Text = label;
-            _settingsVm.ConnectionStatus = $"{label} - {message}";
+            SidebarStatus.Foreground = tone == "Success" ? System.Windows.Media.Brushes.LightGreen : tone == "Warning" ? System.Windows.Media.Brushes.Gold : System.Windows.Media.Brushes.Salmon;
+            _settingsVm.ConnectionStatus = message;
+            _settingsVm.ConnectionTone = tone;
+            _activityVm.Status = label;
+            _activityVm.ConnectionMessage = message;
+            _activityVm.ConnectionTone = tone;
             if (_tray is not null) _tray.Text = $"Oryno Sync - {label}";
         });
         if (state is ConnectionState.ServerUnavailable or ConnectionState.Reconnecting)
@@ -260,7 +282,9 @@ public partial class MainWindow : Window
             EngineState.Offline => "Offline - local changes are safe",
             _ => message
         };
-        Dispatcher.BeginInvoke(() => { StatusText.Text = label; _activityVm.Status = label; });
+        if (label == _lastSyncVisual) return;
+        _lastSyncVisual = label;
+        Dispatcher.BeginInvoke(() => { StatusText.Text = label; });
     }
 
     private void ApplyMappingProgress(SyncMapping mapping, ScanProgress progress)
@@ -269,7 +293,12 @@ public partial class MainWindow : Window
         if (progress.IsComplete) _ = RefreshCountersAsync();
     }
 
-    private void AddActivity(string text) => Dispatcher.BeginInvoke(() => _activityVm.Add($"{DateTime.Now:t}  {text}"));
+    private void AddActivity(string text)
+    {
+        var now = DateTimeOffset.Now;
+        _ = _mappingStore.RecordActivityAsync(new SyncActivityEvent(Guid.NewGuid(), null, null, "Activity", "Indexed", now, null, text));
+        Dispatcher.BeginInvoke(() => _activityVm.Add($"{now:t}  {text}"));
+    }
     private static string SafeError(Exception ex) => ex is SyncApiException api ? $"{api.Code} ({(int)api.Status})" : ex.GetType().Name;
 
     private async Task RefreshMappingsAsync(IReadOnlyList<SyncMapping>? mappings = null)
@@ -436,7 +465,7 @@ public partial class MainWindow : Window
 
     private void SetupTray()
     {
-        _tray = new Forms.NotifyIcon { Icon = System.Drawing.SystemIcons.Application, Text = "Oryno Sync", Visible = true };
+        _tray = new Forms.NotifyIcon { Icon = LoadAppIcon(), Text = "Oryno Sync", Visible = true };
         var menu = new Forms.ContextMenuStrip();
         menu.Items.Add("Oryno Sync");
         menu.Items.Add("Open Oryno Sync", null, (_, _) => ShowFromTray());
@@ -444,6 +473,12 @@ public partial class MainWindow : Window
         menu.Items.Add("Exit", null, (_, _) => { _allowClose = true; Close(); });
         _tray.ContextMenuStrip = menu;
         _tray.DoubleClick += (_, _) => ShowFromTray();
+    }
+
+    private static System.Drawing.Icon LoadAppIcon()
+    {
+        try { return System.Drawing.Icon.ExtractAssociatedIcon(Environment.ProcessPath!) ?? System.Drawing.SystemIcons.Application; }
+        catch { return System.Drawing.SystemIcons.Application; }
     }
 
     private void ShowFromTray() { Show(); WindowState = WindowState.Normal; Activate(); }
@@ -477,13 +512,7 @@ public partial class MainWindow : Window
     {
         _currentPage = page;
         PageTitle.Text = page.ToString();
-        CurrentView.Content = page switch
-        {
-            AppPage.Activity => new ActivityView { DataContext = _activityVm },
-            AppPage.Folders => new FoldersView { DataContext = _foldersVm },
-            AppPage.Settings => new SettingsView { DataContext = _settingsVm },
-            _ => null
-        };
+        CurrentView.Content = page switch { AppPage.Activity => _activityView, AppPage.Folders => _foldersView, AppPage.Settings => _settingsView, _ => null };
         var selected = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(43, 50, 56));
         ActivityNav.Background = page == AppPage.Activity ? selected : System.Windows.Media.Brushes.Transparent;
         FoldersNav.Background = page == AppPage.Folders ? selected : System.Windows.Media.Brushes.Transparent;

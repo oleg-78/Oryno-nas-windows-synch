@@ -25,6 +25,25 @@ public sealed record LocalItem(string RelativePath, ItemType ItemType, long Size
 public sealed record PendingOperation(Guid OperationId, OperationType Type, string RelativePath, string? SecondaryPath = null, DateTimeOffset? CreatedAt = null, int AttemptCount = 0, DateTimeOffset? NextAttemptAt = null, OperationState State = OperationState.Pending, string? LastError = null);
 public sealed record ActivityEntry(string RelativePath, string Action, string Status, DateTimeOffset Timestamp, string? Error = null);
 public sealed record ScanProgress(int FilesFound, int FoldersFound, int ChangesIndexed, bool IsComplete = false);
+public sealed record SyncDashboardSummary(int IndexedFiles, int WaitingCount, int ErrorCount, int FolderCount, DateTimeOffset? LastSuccessfulFileSync);
+public sealed record SyncMappingSummary(Guid MappingId, int IndexedFiles, int WaitingCount, int ErrorCount, DateTimeOffset? LastSuccessfulFileSync);
+public sealed record SyncActivityEvent(Guid EventId, Guid? MappingId, string? RelativePath, string Action, string Status, DateTimeOffset Timestamp, string? ErrorCode = null, string? ErrorMessage = null);
+public sealed record SyncFileError(Guid OperationId, Guid MappingId, string RelativePath, string Operation, string ErrorCode, string UserMessage, string? TechnicalMessage, int AttemptCount, DateTimeOffset LastAttemptAt);
+
+public static class UserFacingErrorMapper
+{
+    public static (string Code, string Message) Map(string? error)
+    {
+        var value = error ?? "";
+        if (value.Contains("DEVICE_REVOKED", StringComparison.OrdinalIgnoreCase) || value.Contains("401", StringComparison.OrdinalIgnoreCase)) return ("AUTHORIZATION_REQUIRED", "Device authorization expired. Re-authorize Oryno Sync.");
+        if (value.Contains("503", StringComparison.OrdinalIgnoreCase) || value.Contains("SERVER_UNAVAILABLE", StringComparison.OrdinalIgnoreCase)) return ("SERVER_UNAVAILABLE", "Oryno NAS is temporarily unavailable.");
+        if (value.Contains("sharing violation", StringComparison.OrdinalIgnoreCase) || value.Contains("being used", StringComparison.OrdinalIgnoreCase)) return ("FILE_LOCKED", "File is currently being used by another application.");
+        if (value.Contains("UnauthorizedAccess", StringComparison.OrdinalIgnoreCase) || value.Contains("access denied", StringComparison.OrdinalIgnoreCase)) return ("ACCESS_DENIED", "Windows denied access to this file.");
+        if (value.Contains("disk full", StringComparison.OrdinalIgnoreCase) || value.Contains("ENOSPC", StringComparison.OrdinalIgnoreCase)) return ("DISK_FULL", "There is not enough free disk space.");
+        if (value.Contains("incompatible", StringComparison.OrdinalIgnoreCase) || value.Contains("invalid filename", StringComparison.OrdinalIgnoreCase)) return ("PATH_INCOMPATIBLE", "This filename is not supported by Windows.");
+        return ("SYNC_ERROR", string.IsNullOrWhiteSpace(value) ? "This file could not be processed." : value);
+    }
+}
 
 public interface ILocalStateStore
 {

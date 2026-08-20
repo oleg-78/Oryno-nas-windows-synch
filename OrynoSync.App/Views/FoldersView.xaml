@@ -8,7 +8,7 @@
           <TextBlock Text="{Binding RootName}" Foreground="{StaticResource MutedBrush}" Margin="0,5,0,0" TextWrapping="Wrap"/>
           <TextBlock Text="{Binding Status}" Margin="0,14,0,0"/>
           <ProgressBar Height="5" Margin="0,8,0,2" IsIndeterminate="True"><ProgressBar.Style><Style TargetType="ProgressBar"><Setter Property="Visibility" Value="Collapsed"/><Style.Triggers><DataTrigger Binding="{Binding IsScanning}" Value="True"><Setter Property="Visibility" Value="Visible"/></DataTrigger></Style.Triggers></Style></ProgressBar.Style></ProgressBar>
-          <TextBlock Text="{Binding PendingText}" Foreground="{StaticResource MutedBrush}" Margin="0,4,0,0" TextWrapping="Wrap"/>
+          <TextBlock Text="{Binding IndexedText}" Foreground="{StaticResource MutedBrush}" Margin="0,4,0,0"/><TextBlock Text="{Binding PendingText}" Foreground="{StaticResource MutedBrush}" Margin="0,2,0,0" TextWrapping="Wrap"/><TextBlock Text="{Binding ErrorsText}" Foreground="{StaticResource MutedBrush}" Margin="0,2,0,0"/><TextBlock Text="{Binding LastSyncText}" Foreground="{StaticResource MutedBrush}" Margin="0,2,0,0"/>
           <WrapPanel Margin="0,14,0,0"><Button Content="Open" Click="Open_Click"/><Button Content="Pause / Resume" Click="Pause_Click"/><Button Content="Remove" Click="Remove_Click" Margin="0"/></WrapPanel>
         </StackPanel></Border>
       </DataTemplate></ItemsControl.ItemTemplate></ItemsControl>
