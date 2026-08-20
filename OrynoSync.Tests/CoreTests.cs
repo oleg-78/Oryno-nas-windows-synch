@@ -1,0 +1,12 @@
+using OrynoSync.Core;
+namespace OrynoSync.Tests;
+public class CoreTests
+{
+    private static async Task<SqliteLocalStateStore> Store(){var p=Path.Combine(Path.GetTempPath(),"oryno-"+Guid.NewGuid()+".db");var s=new SqliteLocalStateStore(p);await s.InitializeAsync();return s;}
+    [Fact] public async Task QueuePersistsAndCoalesces(){var s=await Store();await s.EnqueueAsync(new(Guid.NewGuid(),OperationType.CreateFile,"A.txt"));await s.EnqueueAsync(new(Guid.NewGuid(),OperationType.UpdateFile,"A.txt"));var q=await s.GetPendingAsync(DateTimeOffset.UtcNow);Assert.Single(q);Assert.Equal(OperationType.UpdateFile,q[0].Type);}
+    [Fact] public void IgnoreRulesAreCentralized(){var r=new IgnoreRules();Assert.True(r.IsIgnored("x/Thumbs.db"));Assert.True(r.IsIgnored("~$draft.docx"));Assert.False(r.IsIgnored("draft.docx"));}
+    [Fact] public void WindowsNamesAndCaseCollisionsAreDetected(){Assert.False(PathRules.IsWindowsCompatible("CON.txt"));Assert.False(PathRules.IsWindowsCompatible("a."));Assert.True(PathRules.IsCaseCollision(["A.txt","a.txt"]));}
+    [Fact] public void SuppressionUsesMetadata(){var s=new LocalMutationSuppression();var p="file.txt";var f=new FileInfo(Path.GetTempFileName());s.Expect(p,f.Length,f.LastWriteTimeUtc);Assert.True(s.IsSuppressed(p,f));Assert.False(s.IsSuppressed(p,f));}
+    [Fact] public async Task ReconciliationCreatesAndRemovesOperations(){var root=Path.Combine(Path.GetTempPath(),"oryno-root-"+Guid.NewGuid());Directory.CreateDirectory(root);var file=Path.Combine(root,"Test.txt");await File.WriteAllTextAsync(file,"hello");var store=await Store();var ops=await new LocalReconciler(store,new IgnoreRules()).ScanAsync(root);Assert.Contains(ops,o=>o.Type==OperationType.CreateFile);File.Delete(file);ops=await new LocalReconciler(store,new IgnoreRules()).ScanAsync(root);Assert.Contains(ops,o=>o.Type==OperationType.Delete);Directory.Delete(root);}
+    [Fact] public async Task MockOfflineThenOnline(){var root=Path.Combine(Path.GetTempPath(),"oryno-root-"+Guid.NewGuid());Directory.CreateDirectory(root);var store=await Store();var api=new MockSyncApi{Online=false};await store.EnqueueAsync(new(Guid.NewGuid(),OperationType.CreateFile,"a.txt"));var engine=new SyncEngine(store,api,root);await engine.ProcessQueueAsync();Assert.Equal(EngineState.Offline,engine.State);api.Online=true;await engine.ProcessQueueAsync();Assert.Equal(EngineState.UpToDate,engine.State);Assert.Equal(1,api.SuccessfulOperations);Directory.Delete(root);}
+}
