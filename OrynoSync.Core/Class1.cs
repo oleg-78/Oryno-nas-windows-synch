@@ -5,10 +5,26 @@ public enum SyncItemState { Synced, Waiting, Uploading, Downloading, Conflict, E
 public enum OperationType { CreateFile, UpdateFile, CreateDirectory, Move, Delete }
 public enum OperationState { Pending, InProgress, Completed, Failed, BlockedWaitingForServerCapability }
 public enum EngineState { Disconnected, Connecting, AuthenticationRequired, InitialInventory, Reconciling, OnlineIdle, SyncingMetadata, Offline, Paused, ProtocolError, Error, Syncing=SyncingMetadata, UpToDate=OnlineIdle }
+public enum ConnectionState { Disconnected, Checking, ServerUnavailable, ServerReachable, Connecting, Reconnecting, Connected, AuthenticationRequired, AuthenticationExpired, ServerError, ProtocolError }
+public sealed class ConnectionStateTracker(int failureThreshold = 3)
+{
+    private int _failures;
+    public ConnectionState State { get; private set; } = ConnectionState.Disconnected;
+    public int ConsecutiveFailures => _failures;
+    public ConnectionState Observe(ConnectionStatus status)
+    {
+        if (status == ConnectionStatus.Connected) { _failures = 0; return State = ConnectionState.Connected; }
+        if (status is ConnectionStatus.AuthenticationRequired) return State = ConnectionState.AuthenticationRequired;
+        if (status is ConnectionStatus.AuthenticationRevoked) return State = ConnectionState.AuthenticationExpired;
+        _failures++;
+        return State = _failures >= failureThreshold ? ConnectionState.ServerUnavailable : ConnectionState.Reconnecting;
+    }
+}
 
 public sealed record LocalItem(string RelativePath, ItemType ItemType, long Size, DateTimeOffset Mtime, string? ContentHash = null, string? ServerItemId = null, long? ServerVersion = null, long? LastServerRevision = null, SyncItemState SyncState = SyncItemState.Synced, string? LastError = null);
 public sealed record PendingOperation(Guid OperationId, OperationType Type, string RelativePath, string? SecondaryPath = null, DateTimeOffset? CreatedAt = null, int AttemptCount = 0, DateTimeOffset? NextAttemptAt = null, OperationState State = OperationState.Pending, string? LastError = null);
 public sealed record ActivityEntry(string RelativePath, string Action, string Status, DateTimeOffset Timestamp, string? Error = null);
+public sealed record ScanProgress(int FilesFound, int FoldersFound, int ChangesIndexed, bool IsComplete = false);
 
 public interface ILocalStateStore
 {

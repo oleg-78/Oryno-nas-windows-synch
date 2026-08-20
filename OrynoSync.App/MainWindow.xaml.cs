@@ -4,77 +4,491 @@ using System.Net.Http;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Threading;
-using Forms=System.Windows.Forms;
-using OrynoSync.Core;
+using Forms = System.Windows.Forms;
 using OrynoSync.App.Views;
+using OrynoSync.Core;
 
 namespace OrynoSync.App;
 
 public partial class MainWindow : Window
 {
-    private readonly string _appData=Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),"Oryno Sync");
-    private readonly ILocalStateStore _store;private readonly IRemoteStateStore _remoteStore;private readonly ICredentialStore _credentials;private readonly ISyncMappingStore _mappingStore;private readonly SyncMappingRuntimeManager _mappingRuntime;
-    private readonly List<string> _activity=[];private LocalWatcher? _watcher;private CancellationTokenSource? _localCts;private CancellationTokenSource? _remoteCts;private HttpClient? _http;private OrynoNasSyncApi? _api;private MetadataSyncCoordinator? _metadata;private Forms.NotifyIcon? _tray;private string? _root;private Guid? _selectedRootId;private bool _paused;private bool _allowClose;private int _failures;private AppPage _currentPage=AppPage.Activity;
-    private readonly ActivityViewModel _activityVm=new();private readonly FoldersViewModel _foldersVm=new();private readonly SettingsViewModel _settingsVm=new();
-    private string DatabasePath=>Path.Combine(_appData,"oryno-sync.db");
+    private readonly string _appData = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Oryno Sync");
+    private readonly ILocalStateStore _store;
+    private readonly IRemoteStateStore _remoteStore;
+    private readonly ICredentialStore _credentials;
+    private readonly ISyncMappingStore _mappingStore;
+    private readonly SyncMappingRuntimeManager _mappingRuntime;
+    private readonly ActivityViewModel _activityVm = new();
+    private readonly FoldersViewModel _foldersVm = new();
+    private readonly SettingsViewModel _settingsVm = new();
+    private CancellationTokenSource? _remoteCts;
+    private HttpClient? _http;
+    private OrynoNasSyncApi? _api;
+    private MetadataSyncCoordinator? _metadata;
+    private Forms.NotifyIcon? _tray;
+    private bool _paused;
+    private bool _allowClose;
+    private int _failures;
+    private readonly ConnectionStateTracker _connectionTracker = new();
+    private IReadOnlyList<SyncMapping> _mappings = [];
+    private Guid? _selectedRootId;
+    private AppPage _currentPage = AppPage.Activity;
+
+    private string DatabasePath => Path.Combine(_appData, "oryno-sync.db");
+
     public MainWindow()
     {
-        InitializeComponent();_store=new SqliteLocalStateStore(DatabasePath);_remoteStore=new RemoteStateStore(DatabasePath);_mappingStore=new SqliteSyncMappingStore(DatabasePath);_mappingRuntime=new SyncMappingRuntimeManager(_mappingStore);_mappingRuntime.Activity+=(mapping,text)=>AddActivity($"{Path.GetFileName(mapping.LocalPath)} · {text}");_credentials=new WindowsCredentialStore(Path.Combine(_appData,"Credentials"));_activityVm.PauseOrResume=TogglePause;_activityVm.OpenFolder=OpenFolder_Click;_foldersVm.AddFolder=AddFolder;_foldersVm.OpenFolder=OpenFolder_Click;_settingsVm.Connect=(url,token)=>ConnectAsync(url,token);_settingsVm.TestConnection=url=>TestConnectionAsync(url);_settingsVm.DatabasePath=DatabasePath;_settingsVm.Device=Environment.MachineName+" · Windows";Loaded+=LoadedAsync;NavigateTo(AppPage.Activity);var timer=new DispatcherTimer{Interval=TimeSpan.FromMilliseconds(500)};timer.Tick+=(_,_)=>{if(App.ActivateEvent.WaitOne(0))ShowFromTray();};timer.Start();
+        InitializeComponent();
+        _store = new SqliteLocalStateStore(DatabasePath);
+        _remoteStore = new RemoteStateStore(DatabasePath);
+        _mappingStore = new SqliteSyncMappingStore(DatabasePath);
+        _mappingRuntime = new SyncMappingRuntimeManager(_mappingStore);
+        _mappingRuntime.Activity += (mapping, text) => AddActivity($"{Path.GetFileName(mapping.LocalPath)} - {text}");
+        _mappingRuntime.Progress += (mapping, progress) => Dispatcher.BeginInvoke(() => ApplyMappingProgress(mapping, progress));
+        _credentials = new WindowsCredentialStore(Path.Combine(_appData, "Credentials"));
+        _activityVm.PauseOrResume = TogglePause;
+        _activityVm.OpenFolder = OpenFolder_Click;
+        _foldersVm.AddFolder = AddFolder;
+        _foldersVm.OpenFolder = OpenFolder_Click;
+        _settingsVm.Connect = ConnectAsync;
+        _settingsVm.TestConnection = TestConnectionAsync;
+        _settingsVm.Disconnect = DisconnectAsync;
+        _settingsVm.Reauthorize = ReauthorizeAsync;
+        _settingsVm.DatabasePath = DatabasePath;
+        _settingsVm.Device = Environment.MachineName + " - Windows";
+        Loaded += LoadedAsync;
+        NavigateTo(AppPage.Activity);
+        var timer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(500) };
+        timer.Tick += (_, _) => { if (App.ActivateEvent.WaitOne(0)) ShowFromTray(); };
+        timer.Start();
     }
-    private async void LoadedAsync(object? sender,RoutedEventArgs e)
+
+    private async void LoadedAsync(object? sender, RoutedEventArgs e)
     {
-        await _store.InitializeAsync();await _remoteStore.InitializeAsync();await _mappingStore.InitializeAsync();SetupTray();DeviceText.Text=Environment.MachineName+" · Windows";var server=await _store.GetSettingAsync("server_url")??"https://oryno-nas.remo78.ru";_settingsVm.ServerUrl=server;var rootSetting=await _store.GetSettingAsync("selected_root_id");if(Guid.TryParse(rootSetting,out var rootId))_selectedRootId=rootId;var mappings=await _mappingStore.GetMappingsAsync();if(App.CleanupSampleMappings){foreach(var sample in mappings.Where(x=>x.LocalPath.Contains("OrynoSync-W11-",StringComparison.OrdinalIgnoreCase)).ToArray())await _mappingStore.RemoveMappingAsync(sample.MappingId);mappings=await _mappingStore.GetMappingsAsync();}if(App.SampleMappings&&mappings.Count==0){mappings=[];foreach(var pair in new[]{("Documents","Documents"),("Projects","Projects"),("Photos","Photos")}){var local=Path.Combine(Path.GetTempPath(),"OrynoSync-W11-"+pair.Item1);Directory.CreateDirectory(local);var now=DateTimeOffset.UtcNow;var sample=new SyncMapping(Guid.NewGuid(),local,null,pair.Item2,true,now,now,null,"Sample",null,null,MappingStatus.UpToDate);await _mappingStore.AddMappingAsync(sample);mappings=[..mappings,sample];}}if(_selectedRootId is Guid legacyRoot&&mappings.Count(x=>x.ServerRootId is null)==1){var legacy=mappings.First(x=>x.ServerRootId is null);await _mappingStore.UpdateMappingAsync(legacy with {ServerRootId=legacyRoot,UpdatedAt=DateTimeOffset.UtcNow});mappings=await _mappingStore.GetMappingsAsync();}if(mappings.Count==0)SetStatus(EngineState.Offline,"Add a local folder to start syncing.");await RefreshMappingsAsync(mappings);await _mappingRuntime.RestoreAsync();InitializeProductionClient();_remoteCts=new CancellationTokenSource();_=RemoteLoopAsync(_remoteCts.Token);await RefreshCountersAsync();
+        await _store.InitializeAsync();
+        await _remoteStore.InitializeAsync();
+        await _mappingStore.InitializeAsync();
+        SetupTray();
+        DeviceText.Text = _settingsVm.Device;
+        var server = await _store.GetSettingAsync("server_url") ?? "https://oryno-nas.remo78.ru";
+        _settingsVm.ServerUrl = server;
+        if (Uri.TryCreate(server, UriKind.Absolute, out var serverUri))
+            _settingsVm.HasCredential = !string.IsNullOrWhiteSpace(await _credentials.ReadAsync(CredentialAccount(serverUri)));
+        if (Guid.TryParse(await _store.GetSettingAsync("selected_root_id"), out var selectedRoot)) _selectedRootId = selectedRoot;
+        var mappings = await _mappingStore.GetMappingsAsync();
+        if (App.CleanupSampleMappings)
+        {
+            foreach (var sample in mappings.Where(x => x.LocalPath.Contains("OrynoSync-W11-", StringComparison.OrdinalIgnoreCase)).ToArray())
+                await _mappingStore.RemoveMappingAsync(sample.MappingId);
+            mappings = await _mappingStore.GetMappingsAsync();
+        }
+        if (App.SampleMappings && mappings.Count == 0)
+        {
+            foreach (var pair in new[] { ("Documents", "Documents"), ("Projects", "Projects"), ("Photos", "Photos") })
+            {
+                var local = Path.Combine(Path.GetTempPath(), "OrynoSync-W11-" + pair.Item1);
+                Directory.CreateDirectory(local);
+                var now = DateTimeOffset.UtcNow;
+                var sample = new SyncMapping(Guid.NewGuid(), local, null, pair.Item2, true, now, now, null, "Sample", null, null, MappingStatus.UpToDate);
+                await _mappingStore.AddMappingAsync(sample);
+            }
+            mappings = await _mappingStore.GetMappingsAsync();
+        }
+        if (_selectedRootId is Guid legacyRoot && mappings.Count(x => x.ServerRootId is null) == 1)
+        {
+            var legacy = mappings.First(x => x.ServerRootId is null);
+            await _mappingStore.UpdateMappingAsync(legacy with { ServerRootId = legacyRoot, UpdatedAt = DateTimeOffset.UtcNow });
+            mappings = await _mappingStore.GetMappingsAsync();
+        }
+        await RefreshMappingsAsync(mappings);
+        await _mappingRuntime.RestoreAsync();
+        InitializeProductionClient();
+        RestartRemoteLoop();
+        await RefreshCountersAsync();
     }
-    private string CredentialAccount(Uri uri)=>$"oryno-sync:{uri.Scheme}://{uri.Host}:{uri.Port}";
+
+    private string CredentialAccount(Uri uri) => $"oryno-sync:{uri.Scheme}://{uri.Host}:{uri.Port}";
+
     private void InitializeProductionClient()
     {
-        _http?.Dispose();if(!TryServerUri(_settingsVm.ServerUrl,out var uri))return;var handler=new BearerTokenHandler(ct=>_credentials.ReadAsync(CredentialAccount(uri),ct)){InnerHandler=new SocketsHttpHandler{ConnectTimeout=TimeSpan.FromSeconds(8),PooledConnectionLifetime=TimeSpan.FromMinutes(10)}};_http=new HttpClient(handler);_api=new OrynoNasSyncApi(_http,uri);_metadata=new MetadataSyncCoordinator(_api,_remoteStore);_metadata.Progress+=p=>Dispatcher.Invoke(()=>SetStatus(p.State,p.Message));
+        _http?.Dispose();
+        if (!TryServerUri(_settingsVm.ServerUrl, out var uri)) return;
+        _http = CreateHttpClient(uri, _credentials.ReadAsync);
+        _api = new OrynoNasSyncApi(_http, uri);
+        _metadata = new MetadataSyncCoordinator(_api, _remoteStore);
+        _metadata.Progress += progress => Dispatcher.BeginInvoke(() => SetSyncStatus(progress.State, progress.Message));
     }
-    private async Task StartLocalAsync(string root)
+
+    private HttpClient CreateHttpClient(Uri uri, Func<string, CancellationToken, Task<string?>> reader)
     {
-        _watcher?.Dispose();_localCts?.Cancel();_localCts?.Dispose();_localCts=new CancellationTokenSource();var ignore=new IgnoreRules();var processor=new DebouncedChangeProcessor(_store,root,ignore,new LocalMutationSuppression());processor.Activity+=a=>AddActivity($"{a.RelativePath} · Local {a.Action} · Waiting to upload");_watcher=new LocalWatcher(root,processor);_watcher.Overflowed+=()=>_ = Task.Run(()=>new LocalReconciler(_store,ignore).ScanAsync(root,_localCts.Token));await Task.Run(()=>new LocalReconciler(_store,ignore).ScanAsync(root,_localCts.Token));_watcher.Start();
+        var handler = new BearerTokenHandler(ct => reader(CredentialAccount(uri), ct))
+        {
+            InnerHandler = new SocketsHttpHandler { ConnectTimeout = TimeSpan.FromSeconds(8), PooledConnectionLifetime = TimeSpan.FromMinutes(10) }
+        };
+        return new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(20) };
     }
+
     private async Task RemoteLoopAsync(CancellationToken ct)
     {
-        while(!ct.IsCancellationRequested){if(_paused){await Delay(1000,ct);continue;}try{if(_api is null||_metadata is null){await Delay(4000,ct);continue;}var connection=await _api.TestConnectionAsync(ct);if(connection.Status!=ConnectionStatus.Connected){SetConnection(connection);_failures++;await Delay(BackoffMs(),ct);continue;}_failures=0;SetStatus(EngineState.Connecting,"Connected. Reading sync roots…");var roots=await _metadata.GetRootsAsync(ct);await Dispatcher.InvokeAsync(()=>PopulateRoots(roots));var current=await _mappingStore.GetMappingsAsync(ct);foreach(var mapping in current.Where(x=>x.Enabled&&x.ServerRootId is not null)){await _metadata.RunCycleAsync(mapping.ServerRootId!.Value,ct);await RefreshRemoteAsync(mapping.ServerRootId.Value,ct);await SaveMappingRevisionAsync(mapping,ct);}SetStatus(EngineState.OnlineIdle,current.Count==0?"Add a local folder to start syncing.":"Metadata current. Content transfer requires server S.2.");await RefreshCountersAsync();await Delay(4000,ct);}catch(OperationCanceledException)when(ct.IsCancellationRequested){break;}catch(SyncApiException ex)when(ex.Status==System.Net.HttpStatusCode.Unauthorized){SetStatus(EngineState.AuthenticationRequired,"Oryno NAS authorization is required. Your local changes are safe.");_failures++;await Delay(BackoffMs(),ct);}catch(Exception ex){SetStatus(EngineState.Offline,"Server unavailable. Local changes remain queued.");AddActivity($"Connection error · {SafeError(ex)}");_failures++;await Delay(BackoffMs(),ct);}}
+        while (!ct.IsCancellationRequested)
+        {
+            if (_paused) { await Delay(1000, ct); continue; }
+            try
+            {
+                if (_api is null || _metadata is null) { await Delay(4000, ct); continue; }
+                var connection = await _api.TestConnectionAsync(ct);
+                if (connection.Status != ConnectionStatus.Connected)
+                {
+                    _failures++;
+                    SetConnection(connection, _failures);
+                    await Delay(BackoffMs(), ct);
+                    continue;
+                }
+                _failures = 0;
+                _connectionTracker.Observe(ConnectionStatus.Connected);
+                SetConnectionState(ConnectionState.Connected, "Connected to Oryno NAS.");
+                var roots = await _metadata.GetRootsAsync(ct);
+                await Dispatcher.InvokeAsync(() => PopulateRoots(roots));
+                var mappings = await _mappingStore.GetMappingsAsync(ct);
+                foreach (var mapping in mappings.Where(x => x.Enabled && x.ServerRootId is not null))
+                {
+                    await _metadata.RunCycleAsync(mapping.ServerRootId!.Value, ct);
+                    await RefreshRemoteAsync(mapping.ServerRootId.Value, ct);
+                }
+                SetSyncStatus(EngineState.OnlineIdle, mappings.Count == 0 ? "Add a local folder to start syncing." : "Connected. Changes stay safely queued until content sync is available.");
+                await RefreshCountersAsync();
+                await Delay(4000, ct);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
+            catch (SyncApiException ex) when (ex.Status == System.Net.HttpStatusCode.Unauthorized)
+            {
+                SetConnectionState(ConnectionState.AuthenticationExpired, "Authorization expired. Local changes are safe.");
+                await Delay(BackoffMs(), ct);
+            }
+            catch (Exception ex)
+            {
+                _failures++;
+                SetConnectionState(_failures >= 3 ? ConnectionState.ServerUnavailable : ConnectionState.Reconnecting,
+                    _failures >= 3 ? "Oryno NAS is unavailable. Local changes are safe." : "Reconnecting to Oryno NAS...");
+                AddActivity($"Connection error - {SafeError(ex)}");
+                await Delay(BackoffMs(), ct);
+            }
+        }
     }
-    private int BackoffMs()=>Math.Min(60000,(int)(2000*Math.Pow(2,Math.Min(_failures,5))));private static async Task Delay(int ms,CancellationToken ct){try{await Task.Delay(ms,ct);}catch(OperationCanceledException){}}
-    private void PopulateRoots(IReadOnlyList<SyncRootDto> roots){var enabled=roots.Where(x=>x.Enabled).ToArray();_foldersVm.SetRoots(enabled,_selectedRootId);foreach(var card in _foldersVm.Mappings){if(card.Mapping.ServerRootId is Guid id)card.RootName=enabled.FirstOrDefault(x=>x.RootId==id)?.Name??"Oryno NAS root unavailable";}}
-    private async Task RefreshRemoteAsync(Guid rootId,CancellationToken ct){var state=await _remoteStore.GetRootStateAsync(rootId,ct);var count=await _remoteStore.CountRemoteItemsAsync(rootId,ct);var downloads=await _remoteStore.CountPlanningAsync(rootId,RemotePlanningState.NeedsDownload,ct);await Dispatcher.InvokeAsync(()=>_foldersVm.Stats=$"Remote metadata: {count:N0} items · Waiting for content: {downloads:N0} · Revision: {state.LastRevision:N0}");}
-    private async Task RefreshCountersAsync(){var count=await _mappingStore.PendingCountAsync();await Dispatcher.InvokeAsync(()=>{_activityVm.QueueText=$"{count:N0} local changes waiting";_foldersVm.Stats=$"Files: —   Folders: —   Pending changes: {count:N0}";_settingsVm.QueueLength=count.ToString("N0");});}
-    private void SetConnection(ConnectionResult result){var state=result.Status switch{ConnectionStatus.AuthenticationRequired or ConnectionStatus.AuthenticationRevoked=>EngineState.AuthenticationRequired,ConnectionStatus.ProtocolError or ConnectionStatus.TlsError=>EngineState.ProtocolError,_=>EngineState.Offline};var message=result.Status switch{ConnectionStatus.AuthenticationRequired=>"Server reachable — device authorization required.",ConnectionStatus.AuthenticationRevoked=>"Device authorization was revoked. Local changes are safe.",ConnectionStatus.TlsError=>"TLS certificate or handshake error.",ConnectionStatus.ProtocolError=>"Server reached, but the Sync protocol response is invalid.",_=>"Server unavailable. Local changes continue to queue."};SetStatus(state,message);}
-    private void SetStatus(EngineState state,string message)=>Dispatcher.Invoke(()=>{SidebarStatus.Text=state.ToString();StatusText.Text=message;_activityVm.Status=message;_settingsVm.ConnectionStatus=state.ToString();if(_tray is not null)_tray.Text=("Oryno Sync — "+state).Substring(0,Math.Min(63,("Oryno Sync — "+state).Length));});
-    private void AddActivity(string text)=>Dispatcher.Invoke(()=>_activityVm.Add($"{DateTime.Now:t}  {text}"));
-    private static string SafeError(Exception ex)=>ex is SyncApiException api?$"{api.Code} ({(int)api.Status})":ex.GetType().Name;
-    private async Task RefreshMappingsAsync(IReadOnlyList<SyncMapping>? mappings=null){mappings??=await _mappingStore.GetMappingsAsync();await Dispatcher.InvokeAsync(()=>{_foldersVm.Mappings.Clear();foreach(var mapping in mappings){var card=new MappingCardViewModel(mapping);card.Open=()=>OpenMapping(mapping.LocalPath);card.Pause=()=>ToggleMappingPause(card);card.Remove=()=>RemoveMapping(mapping);_foldersVm.Mappings.Add(card);}});}
-    private void OpenMapping(string path){if(Directory.Exists(path))Process.Start(new ProcessStartInfo("explorer.exe",path){UseShellExecute=true});}
-    private async void ToggleMappingPause(MappingCardViewModel card){var paused=!card.IsPaused;card.IsPaused=paused;var current=await _mappingStore.GetMappingAsync(card.Mapping.MappingId);if(current is not null){await _mappingRuntime.SetPausedAsync(current,paused);card.Status=paused?MappingStatus.Paused.ToString():MappingStatus.UpToDate.ToString();}}
-    private async void RemoveMapping(SyncMapping mapping){var answer=System.Windows.MessageBox.Show(this,$"Stop syncing {mapping.LocalPath}?\n\nFiles on Windows and Oryno NAS will not be deleted.","Remove from Oryno Sync",MessageBoxButton.YesNo,MessageBoxImage.Warning);if(answer!=MessageBoxResult.Yes)return;_mappingRuntime.Stop(mapping.MappingId);await _mappingStore.RemoveMappingAsync(mapping.MappingId);await RefreshMappingsAsync();AddActivity($"Folder removed from sync · {mapping.LocalPath}");}
-    private async void AddFolder(){var dialog=new AddFolderWindow(_foldersVm.Roots){Owner=this};if(dialog.ShowDialog()!=true)return;var path=SyncMappingRules.CanonicalLocalPath(dialog.LocalPath);var existing=await _mappingStore.GetMappingsAsync();if(existing.Any(x=>SyncMappingRules.Overlaps(x.LocalPath,path))){System.Windows.MessageBox.Show(this,"This folder overlaps an existing sync folder.","SYNC_FOLDER_OVERLAP",MessageBoxButton.OK,MessageBoxImage.Information);return;}if(dialog.SelectedRoot is not null&&existing.Any(x=>x.ServerRootId==dialog.SelectedRoot.RootId)){System.Windows.MessageBox.Show(this,"This Oryno NAS root is already mapped on this device.","Duplicate server root",MessageBoxButton.OK,MessageBoxImage.Information);return;}var now=DateTimeOffset.UtcNow;var mapping=new SyncMapping(Guid.NewGuid(),dialog.LocalPath,dialog.SelectedRoot?.RootId,dialog.SelectedRoot?.Name,true,now,now,null,"NotStarted",null,null,dialog.SelectedRoot is null?MappingStatus.ServerRootUnavailable:MappingStatus.Offline);await _mappingStore.AddMappingAsync(mapping);await _mappingRuntime.StartAsync(mapping);await RefreshMappingsAsync();AddActivity($"Folder added to sync · {mapping.LocalPath}");}
-    private async Task SaveMappingRevisionAsync(SyncMapping mapping,CancellationToken ct){var state=await _remoteStore.GetRootStateAsync(mapping.ServerRootId!.Value,ct);await _mappingStore.UpdateMappingAsync(mapping with {LastServerRevision=state.LastRevision,UpdatedAt=DateTimeOffset.UtcNow},ct);}
-    private async void ConnectAsync(string serverUrl,string token)
+
+    private int BackoffMs() => Math.Min(60000, (int)(2000 * Math.Pow(2, Math.Min(_failures, 5))));
+    private static async Task Delay(int ms, CancellationToken ct) { try { await Task.Delay(ms, ct); } catch (OperationCanceledException) { } }
+
+    private void PopulateRoots(IReadOnlyList<SyncRootDto> roots)
     {
-        if(!TryServerUri(serverUrl,out var uri))return;if(string.IsNullOrWhiteSpace(token)){SetStatus(EngineState.AuthenticationRequired,"Enter the one-time device authorization token issued by Oryno NAS.");return;}SetStatus(EngineState.Connecting,"Testing device authorization…");using var tempHttp=new HttpClient(new BearerTokenHandler(_=>Task.FromResult<string?>(token)){InnerHandler=new SocketsHttpHandler{ConnectTimeout=TimeSpan.FromSeconds(8)}});var tempApi=new OrynoNasSyncApi(tempHttp,uri);var result=await tempApi.TestConnectionAsync();if(result.Status!=ConnectionStatus.Connected){SetConnection(result);return;}var old=await _store.GetSettingAsync("server_url");if(!string.Equals(old,uri.GetLeftPart(UriPartial.Authority),StringComparison.OrdinalIgnoreCase)){_selectedRootId=null;await _store.SaveSettingAsync("selected_root_id",string.Empty);}await _credentials.SaveAsync(CredentialAccount(uri),token);await _store.SaveSettingAsync("server_url",uri.GetLeftPart(UriPartial.Authority));_settingsVm.ServerUrl=uri.GetLeftPart(UriPartial.Authority);InitializeProductionClient();RestartRemoteLoop();SetStatus(EngineState.Connecting,"Device authorized. Loading roots…");
+        var enabled = roots.Where(x => x.Enabled).ToArray();
+        _foldersVm.SetRoots(enabled, _selectedRootId);
+        foreach (var card in _foldersVm.Mappings)
+            if (card.Mapping.ServerRootId is Guid id)
+                card.RootName = enabled.FirstOrDefault(x => x.RootId == id)?.Name ?? "Oryno NAS root unavailable";
     }
-    private async void TestConnectionAsync(string serverUrl){if(!TryServerUri(serverUrl,out _))return;InitializeProductionClient();if(_api is not null)SetConnection(await _api.TestConnectionAsync());}
-    private bool TryServerUri(string value,out Uri uri){if(Uri.TryCreate(value.Trim(),UriKind.Absolute,out var parsed)&&parsed.Scheme==Uri.UriSchemeHttps){uri=parsed;return true;}uri=null!;SetStatus(EngineState.ProtocolError,"Production server URL must use HTTPS.");return false;}
-    private async void ChooseFolder(){using var dialog=new Forms.FolderBrowserDialog{Description="Choose an existing Oryno Sync folder",SelectedPath=_root??string.Empty};if(dialog.ShowDialog()!=Forms.DialogResult.OK)return;_paused=true;_watcher?.Dispose();_localCts?.Cancel();_root=dialog.SelectedPath;await _store.SaveSettingAsync("sync_root",_root);_foldersVm.LocalFolder=_root;await StartLocalAsync(_root);_paused=false;RestartRemoteLoop();AddActivity($"Local folder changed · {_root}");}
-    private void RestartRemoteLoop(){_remoteCts?.Cancel();_remoteCts?.Dispose();_remoteCts=new CancellationTokenSource();_failures=0;_=RemoteLoopAsync(_remoteCts.Token);}
-    private void TogglePause(){_paused=!_paused;_activityVm.IsPaused=_paused;SetStatus(_paused?EngineState.Paused:EngineState.Connecting,_paused?"Metadata transfers paused. Local watcher remains active.":"Resuming metadata connection…");if(!_paused)RestartRemoteLoop();}
-    private void OpenFolder_Click(){if(_root is not null&&Directory.Exists(_root))Process.Start(new ProcessStartInfo("explorer.exe",_root){UseShellExecute=true});}
-    private void SetupTray(){_tray=new Forms.NotifyIcon{Icon=System.Drawing.SystemIcons.Application,Text="Oryno Sync",Visible=true};var menu=new Forms.ContextMenuStrip();menu.Items.Add("Oryno Sync");menu.Items.Add("Open Oryno NAS Folder",null,(_,_)=>OpenFolder_Click());menu.Items.Add("Open Oryno Sync",null,(_,_)=>ShowFromTray());menu.Items.Add("Pause Syncing",null,(_,_)=>TogglePause());menu.Items.Add("Exit",null,(_,_)=>{_allowClose=true;Close();});_tray.ContextMenuStrip=menu;_tray.DoubleClick+=(_,_)=>ShowFromTray();}
-    private void ShowFromTray(){Show();WindowState=WindowState.Normal;Activate();}private void Window_Closing(object? sender,System.ComponentModel.CancelEventArgs e){if(!_allowClose){e.Cancel=true;Hide();return;}_remoteCts?.Cancel();_localCts?.Cancel();_mappingRuntime.Dispose();_watcher?.Dispose();_http?.Dispose();_tray?.Dispose();Dispatcher.BeginInvoke(()=>System.Windows.Application.Current.Shutdown());}
-    private void Window_SizeChanged(object sender,SizeChangedEventArgs e){var narrow=ActualWidth<650;NavColumn.Width=narrow?new GridLength(0):new GridLength(190);Sidebar.Visibility=narrow?Visibility.Collapsed:Visibility.Visible;CompactMenu.Visibility=narrow?Visibility.Visible:Visibility.Collapsed;}
-    private void CompactMenu_Click(object sender,RoutedEventArgs e)=>NavigateTo(_currentPage);
-    private void Activity_Click(object sender,RoutedEventArgs e)=>NavigateTo(AppPage.Activity);
-    private void Folders_Click(object sender,RoutedEventArgs e)=>NavigateTo(AppPage.Folders);
-    private void Settings_Click(object sender,RoutedEventArgs e)=>NavigateTo(AppPage.Settings);
-    public void SelectPage(AppPage page)=>NavigateTo(page);
-    public void ShowAddFolderDialogForCapture(){var dialog=new AddFolderWindow(_foldersVm.Roots){Owner=this};dialog.Show();}
-    private void NavigateTo(AppPage page){_currentPage=page;PageTitle.Text=page.ToString();CurrentView.Content=page switch{AppPage.Activity=>CreateActivityView(),AppPage.Folders=>CreateFoldersView(),AppPage.Settings=>CreateSettingsView(),_=>null};ActivityNav.Background=page==AppPage.Activity?new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(43,50,56)):System.Windows.Media.Brushes.Transparent;FoldersNav.Background=page==AppPage.Folders?new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(43,50,56)):System.Windows.Media.Brushes.Transparent;SettingsNav.Background=page==AppPage.Settings?new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(43,50,56)):System.Windows.Media.Brushes.Transparent;}
-    private ActivityView CreateActivityView(){var view=new ActivityView{DataContext=_activityVm};return view;}
-    private FoldersView CreateFoldersView(){var view=new FoldersView{DataContext=_foldersVm};return view;}
-    private SettingsView CreateSettingsView(){var view=new SettingsView{DataContext=_settingsVm};return view;}
+
+    private async Task RefreshRemoteAsync(Guid rootId, CancellationToken ct)
+    {
+        var state = await _remoteStore.GetRootStateAsync(rootId, ct);
+        var count = await _remoteStore.CountRemoteItemsAsync(rootId, ct);
+        var downloads = await _remoteStore.CountPlanningAsync(rootId, RemotePlanningState.NeedsDownload, ct);
+        await Dispatcher.InvokeAsync(() => _foldersVm.Stats = $"Remote metadata: {count:N0} items - Waiting for content: {downloads:N0} - Revision: {state.LastRevision:N0}");
+    }
+
+    private async Task RefreshCountersAsync()
+    {
+        var count = await _mappingStore.PendingCountAsync();
+        await Dispatcher.InvokeAsync(() =>
+        {
+            _activityVm.QueueText = $"{count:N0} local changes waiting to sync";
+            _foldersVm.Stats = $"Pending changes: {count:N0}";
+            _settingsVm.QueueLength = count.ToString("N0");
+        });
+    }
+
+    private void SetConnection(ConnectionResult result, int failures)
+    {
+        var state = _connectionTracker.Observe(result.Status);
+        if (result.Status == ConnectionStatus.TlsError) state = ConnectionState.ProtocolError;
+        if (result.Status == ConnectionStatus.ProtocolError) state = ConnectionState.ServerError;
+        failures = _connectionTracker.ConsecutiveFailures;
+        var message = result.Status switch
+        {
+            ConnectionStatus.AuthenticationRequired => "Server is reachable. Authorization is required.",
+            ConnectionStatus.AuthenticationRevoked => "Authorization expired. Local changes are safe.",
+            ConnectionStatus.TlsError => "TLS certificate or handshake error.",
+            ConnectionStatus.ProtocolError => "Server reached, but its response was invalid.",
+            _ when failures < 3 => "Reconnecting to Oryno NAS...",
+            _ => "Oryno NAS is unavailable. Local changes are safe."
+        };
+        SetConnectionState(state, message);
+    }
+
+    private void SetConnectionState(ConnectionState state, string message)
+    {
+        var label = state switch
+        {
+            ConnectionState.Connected => "Connected",
+            ConnectionState.Reconnecting => "Reconnecting...",
+            ConnectionState.AuthenticationRequired => "Sign in required",
+            ConnectionState.AuthenticationExpired => "Authorization expired",
+            ConnectionState.ProtocolError or ConnectionState.ServerError => "Server error",
+            ConnectionState.ServerUnavailable => "Server unavailable",
+            ConnectionState.Checking => "Checking...",
+            _ => "Disconnected"
+        };
+        Dispatcher.BeginInvoke(() =>
+        {
+            SidebarStatus.Text = label;
+            _settingsVm.ConnectionStatus = $"{label} - {message}";
+            if (_tray is not null) _tray.Text = $"Oryno Sync - {label}";
+        });
+        if (state is ConnectionState.ServerUnavailable or ConnectionState.Reconnecting)
+            SetSyncStatus(EngineState.Offline, "Offline - local changes are safe");
+    }
+
+    private void SetSyncStatus(EngineState state, string message)
+    {
+        var label = state switch
+        {
+            EngineState.OnlineIdle or EngineState.UpToDate => message.Contains("content", StringComparison.OrdinalIgnoreCase) ? "Waiting for server content sync" : "Up to date",
+            EngineState.InitialInventory or EngineState.Reconciling => "Updating metadata...",
+            EngineState.SyncingMetadata or EngineState.Syncing => "Syncing metadata...",
+            EngineState.Paused => "Sync paused",
+            EngineState.AuthenticationRequired => "Waiting for authorization",
+            EngineState.Offline => "Offline - local changes are safe",
+            _ => message
+        };
+        Dispatcher.BeginInvoke(() => { StatusText.Text = label; _activityVm.Status = label; });
+    }
+
+    private void ApplyMappingProgress(SyncMapping mapping, ScanProgress progress)
+    {
+        _foldersVm.ApplyMapping(mapping, progress);
+        if (progress.IsComplete) _ = RefreshCountersAsync();
+    }
+
+    private void AddActivity(string text) => Dispatcher.BeginInvoke(() => _activityVm.Add($"{DateTime.Now:t}  {text}"));
+    private static string SafeError(Exception ex) => ex is SyncApiException api ? $"{api.Code} ({(int)api.Status})" : ex.GetType().Name;
+
+    private async Task RefreshMappingsAsync(IReadOnlyList<SyncMapping>? mappings = null)
+    {
+        mappings ??= await _mappingStore.GetMappingsAsync();
+        _mappings = mappings;
+        await Dispatcher.InvokeAsync(() =>
+        {
+            _foldersVm.SetMappings(mappings);
+            foreach (var card in _foldersVm.Mappings)
+            {
+                card.Open = () => OpenMapping(card.LocalPath);
+                card.Pause = () => ToggleMappingPause(card);
+                card.Remove = () => RemoveMapping(card.Mapping);
+            }
+        });
+    }
+
+    private void OpenMapping(string path)
+    {
+        if (Directory.Exists(path)) Process.Start(new ProcessStartInfo("explorer.exe", path) { UseShellExecute = true });
+    }
+
+    private async void ToggleMappingPause(MappingCardViewModel card)
+    {
+        var current = await _mappingStore.GetMappingAsync(card.MappingId);
+        if (current is not null) await _mappingRuntime.SetPausedAsync(current, current.Status != MappingStatus.Paused);
+    }
+
+    private async void RemoveMapping(SyncMapping mapping)
+    {
+        if (System.Windows.MessageBox.Show(this, $"Stop syncing {mapping.LocalPath}?\n\nFiles on Windows and Oryno NAS will not be deleted.",
+            "Remove from Oryno Sync", System.Windows.MessageBoxButton.YesNo, System.Windows.MessageBoxImage.Warning) != System.Windows.MessageBoxResult.Yes) return;
+        _mappingRuntime.Stop(mapping.MappingId);
+        await _mappingStore.RemoveMappingAsync(mapping.MappingId);
+        await RefreshMappingsAsync();
+    }
+
+    private async void AddFolder()
+    {
+        var dialog = new AddFolderWindow(_foldersVm.Roots) { Owner = this };
+        if (dialog.ShowDialog() != true) return;
+        var path = SyncMappingRules.CanonicalLocalPath(dialog.LocalPath);
+        var existing = await _mappingStore.GetMappingsAsync();
+        if (existing.Any(x => SyncMappingRules.Overlaps(x.LocalPath, path)))
+        {
+            System.Windows.MessageBox.Show(this, "This folder overlaps an existing sync folder.", "Folder already covered", System.Windows.MessageBoxButton.OK, System.Windows.MessageBoxImage.Information);
+            return;
+        }
+        if (dialog.SelectedRoot is not null && existing.Any(x => x.ServerRootId == dialog.SelectedRoot.RootId))
+        {
+            System.Windows.MessageBox.Show(this, "This Oryno NAS root is already mapped on this device.", "NAS folder already mapped", System.Windows.MessageBoxButton.OK, System.Windows.MessageBoxImage.Information);
+            return;
+        }
+        var now = DateTimeOffset.UtcNow;
+        var mapping = new SyncMapping(Guid.NewGuid(), dialog.LocalPath, dialog.SelectedRoot?.RootId, dialog.SelectedRoot?.Name, true,
+            now, now, null, "NotStarted", null, null, dialog.SelectedRoot is null ? MappingStatus.ServerRootUnavailable : MappingStatus.Scanning);
+        await _mappingStore.AddMappingAsync(mapping);
+        if (mapping.ServerRootId is Guid selectedRoot)
+        {
+            _selectedRootId = selectedRoot;
+            await _store.SaveSettingAsync("selected_root_id", selectedRoot.ToString());
+        }
+        await RefreshMappingsAsync();
+        await _mappingRuntime.StartAsync(mapping);
+        AddActivity($"Folder added - scan started in background: {mapping.LocalPath}");
+    }
+
+    private async Task ConnectAsync(string serverUrl, string token)
+    {
+        _settingsVm.IsConnecting = true;
+        SetConnectionState(ConnectionState.Connecting, "Connecting to Oryno NAS...");
+        try
+        {
+            if (!TryServerUri(serverUrl, out var uri)) { SetConnectionState(ConnectionState.ProtocolError, "Production server URL must use HTTPS."); return; }
+            using var http = CreateTokenHttpClient(uri, token);
+            var result = await new OrynoNasSyncApi(http, uri).TestConnectionAsync();
+            if (result.Status != ConnectionStatus.Connected)
+            {
+                SetConnection(result, 3);
+                _settingsVm.TestResult = result.Status == ConnectionStatus.AuthenticationRequired ? "Authorization failed. The device token is invalid or expired." : "Cannot connect to Oryno NAS.";
+                return;
+            }
+            await _credentials.SaveAsync(CredentialAccount(uri), token);
+            await _store.SaveSettingAsync("server_url", uri.GetLeftPart(UriPartial.Authority));
+            _settingsVm.ServerUrl = uri.GetLeftPart(UriPartial.Authority);
+            _settingsVm.HasCredential = true;
+            InitializeProductionClient();
+            RestartRemoteLoop();
+            SetConnectionState(ConnectionState.Connected, "Connected to Oryno NAS.");
+        }
+        finally { _settingsVm.IsConnecting = false; }
+    }
+
+    private HttpClient CreateTokenHttpClient(Uri uri, string token) =>
+        new(new BearerTokenHandler(_ => Task.FromResult<string?>(token)) { InnerHandler = new SocketsHttpHandler { ConnectTimeout = TimeSpan.FromSeconds(8) } })
+        { Timeout = TimeSpan.FromSeconds(20) };
+
+    private async Task TestConnectionAsync(string serverUrl)
+    {
+        _settingsVm.IsTesting = true;
+        _settingsVm.TestResult = "Checking server...";
+        try
+        {
+            if (!TryServerUri(serverUrl, out var uri)) { _settingsVm.TestResult = "Enter an HTTPS server address."; return; }
+            using var http = CreateHttpClient(uri, _credentials.ReadAsync);
+            var result = await new OrynoNasSyncApi(http, uri).TestConnectionAsync();
+            _settingsVm.TestResult = result.Status switch
+            {
+                ConnectionStatus.Connected => "✓ Server is reachable and authorization is valid.",
+                ConnectionStatus.AuthenticationRequired or ConnectionStatus.AuthenticationRevoked => "✓ Server is reachable. Authorization is required.",
+                ConnectionStatus.TlsError => "TLS error. Check the server certificate.",
+                _ => "Server is unavailable. Try again."
+            };
+        }
+        finally { _settingsVm.IsTesting = false; }
+    }
+
+    private async void DisconnectAsync()
+    {
+        if (TryServerUri(_settingsVm.ServerUrl, out var uri)) await _credentials.DeleteAsync(CredentialAccount(uri));
+        _settingsVm.HasCredential = false;
+        _settingsVm.TestResult = "";
+        SetConnectionState(ConnectionState.Disconnected, "Enter a device token to connect.");
+        _remoteCts?.Cancel();
+    }
+
+    private async void ReauthorizeAsync()
+    {
+        if (TryServerUri(_settingsVm.ServerUrl, out var uri)) await _credentials.DeleteAsync(CredentialAccount(uri));
+        _settingsVm.HasCredential = false;
+        _settingsVm.TestResult = "Enter a new device authorization token.";
+    }
+
+    private bool TryServerUri(string value, out Uri uri)
+    {
+        if (Uri.TryCreate(value.Trim(), UriKind.Absolute, out var parsed) && parsed.Scheme == Uri.UriSchemeHttps) { uri = parsed; return true; }
+        uri = null!;
+        return false;
+    }
+
+    private void RestartRemoteLoop()
+    {
+        _remoteCts?.Cancel();
+        _remoteCts?.Dispose();
+        _remoteCts = new CancellationTokenSource();
+        _failures = 0;
+        _ = RemoteLoopAsync(_remoteCts.Token);
+    }
+
+    private void TogglePause()
+    {
+        _paused = !_paused;
+        _activityVm.IsPaused = _paused;
+        SetSyncStatus(_paused ? EngineState.Paused : EngineState.Connecting, _paused ? "Sync paused" : "Resuming...");
+        if (!_paused) RestartRemoteLoop();
+    }
+
+    private void OpenFolder_Click()
+    {
+        var path = _mappings.FirstOrDefault(x => Directory.Exists(x.LocalPath))?.LocalPath;
+        if (path is not null) OpenMapping(path);
+    }
+
+    private void SetupTray()
+    {
+        _tray = new Forms.NotifyIcon { Icon = System.Drawing.SystemIcons.Application, Text = "Oryno Sync", Visible = true };
+        var menu = new Forms.ContextMenuStrip();
+        menu.Items.Add("Oryno Sync");
+        menu.Items.Add("Open Oryno Sync", null, (_, _) => ShowFromTray());
+        menu.Items.Add("Pause syncing", null, (_, _) => TogglePause());
+        menu.Items.Add("Exit", null, (_, _) => { _allowClose = true; Close(); });
+        _tray.ContextMenuStrip = menu;
+        _tray.DoubleClick += (_, _) => ShowFromTray();
+    }
+
+    private void ShowFromTray() { Show(); WindowState = WindowState.Normal; Activate(); }
+
+    private void Window_Closing(object? sender, System.ComponentModel.CancelEventArgs e)
+    {
+        if (!_allowClose) { e.Cancel = true; Hide(); return; }
+        _remoteCts?.Cancel();
+        _mappingRuntime.Dispose();
+        _http?.Dispose();
+        _tray?.Dispose();
+        Dispatcher.BeginInvoke(() => System.Windows.Application.Current.Shutdown());
+    }
+
+    private void Window_SizeChanged(object sender, SizeChangedEventArgs e)
+    {
+        var narrow = ActualWidth < 650;
+        NavColumn.Width = narrow ? new GridLength(0) : new GridLength(190);
+        Sidebar.Visibility = narrow ? Visibility.Collapsed : Visibility.Visible;
+        CompactMenu.Visibility = narrow ? Visibility.Visible : Visibility.Collapsed;
+    }
+
+    private void CompactMenu_Click(object sender, RoutedEventArgs e) => NavigateTo(_currentPage);
+    private void Activity_Click(object sender, RoutedEventArgs e) => NavigateTo(AppPage.Activity);
+    private void Folders_Click(object sender, RoutedEventArgs e) => NavigateTo(AppPage.Folders);
+    private void Settings_Click(object sender, RoutedEventArgs e) => NavigateTo(AppPage.Settings);
+    public void SelectPage(AppPage page) => NavigateTo(page);
+    public void ShowAddFolderDialogForCapture() => new AddFolderWindow(_foldersVm.Roots) { Owner = this }.Show();
+
+    private void NavigateTo(AppPage page)
+    {
+        _currentPage = page;
+        PageTitle.Text = page.ToString();
+        CurrentView.Content = page switch
+        {
+            AppPage.Activity => new ActivityView { DataContext = _activityVm },
+            AppPage.Folders => new FoldersView { DataContext = _foldersVm },
+            AppPage.Settings => new SettingsView { DataContext = _settingsVm },
+            _ => null
+        };
+        var selected = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(43, 50, 56));
+        ActivityNav.Background = page == AppPage.Activity ? selected : System.Windows.Media.Brushes.Transparent;
+        FoldersNav.Background = page == AppPage.Folders ? selected : System.Windows.Media.Brushes.Transparent;
+        SettingsNav.Background = page == AppPage.Settings ? selected : System.Windows.Media.Brushes.Transparent;
+    }
 }
 
 public enum AppPage { Activity, Folders, Settings }
