@@ -40,6 +40,12 @@ SQLite lives at `%LOCALAPPDATA%\Oryno Sync\oryno-sync.db`. Tables are `local_ite
 
 The WPF host owns a named mutex and activation event. Closing the window hides it; tray Exit cancels HTTP/polling, disposes watcher/tray, and allows process shutdown. `WindowsCredentialStore` uses CurrentUser DPAPI in a separate credential directory; no token is stored in SQLite/settings/logs. Autostart uses HKCU Run without elevation. Changing the local folder stops/cancels the old watcher and starts reconciliation for the new root without application restart.
 
+## W.1.2 multiple mappings
+
+`sync_mappings` is the application configuration boundary. Each row binds one canonical Windows local path to at most one server root on this device. `mapping_local_items` and `mapping_pending_operations` carry `mapping_id`, so queues and local metadata are isolated. The migration creates the first mapping from the legacy `settings.sync_root` and copies existing local items and pending operations without clearing them.
+
+`SyncMappingRuntimeManager` owns one `FileSystemWatcher` and one local reconciliation runtime per enabled mapping while sharing SQLite, credentials, HTTP client, and metadata coordination. Missing or removable local roots become `LocalFolderUnavailable`; scans abort without synthesizing DELETE operations. Overlapping local paths and duplicate server roots are rejected before a mapping is saved. Removing a mapping stops its watcher and deletes configuration metadata only; local and server files are untouched.
+
 ## Known W.1 limits
 
 Live NAS verification is blocked while `https://oryno-nas.remo78.ru` times out from this Windows host. Device registration remains the server's browser/admin bootstrap flow because S.1 has no self-service desktop registration endpoint. The client has no content transfer, mutations, MSIX, Explorer overlays, or Files On-Demand. The existing Core hash abstraction is still the server-compatible seam; W.1 does not invent a content hash protocol absent S.2.

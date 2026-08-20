@@ -47,13 +47,33 @@ public sealed class FoldersViewModel : ViewModelBase
     public string Stats { get => _stats; set => Set(ref _stats, value); }
     public Action? ChangeFolder { get; set; }
     public Action? OpenFolder { get; set; }
+    public Action? AddFolder { get; set; }
     public IReadOnlyList<SyncRootDto> Roots { get; private set; } = [];
+    public ObservableCollection<MappingCardViewModel> Mappings { get; } = [];
     public void SetRoots(IReadOnlyList<SyncRootDto> roots, Guid? selected)
     {
         Roots = roots;
         RootName = selected is Guid id ? roots.FirstOrDefault(x => x.RootId == id)?.Name ?? "Selected root unavailable" : roots.Count == 0 ? "Unavailable while server is offline" : "Select a sync root";
         Raise(nameof(Roots));
     }
+}
+
+public sealed class MappingCardViewModel : ViewModelBase
+{
+    private string _status = "Offline";
+    private string _pending = "0 changes waiting";
+    private string _rootName = "Oryno NAS root not configured";
+    private bool _paused;
+    public SyncMapping Mapping { get; }
+    public string LocalPath => Mapping.LocalPath;
+    public string RootName { get => _rootName; set => Set(ref _rootName, value); }
+    public string Status { get => _status; set => Set(ref _status, value); }
+    public string PendingText { get => _pending; set => Set(ref _pending, value); }
+    public bool IsPaused { get => _paused; set => Set(ref _paused, value); }
+    public Action? Open { get; set; }
+    public Action? Pause { get; set; }
+    public Action? Remove { get; set; }
+    public MappingCardViewModel(SyncMapping mapping) { Mapping = mapping; RootName = mapping.ServerRootName ?? "Oryno NAS root not configured"; Status = mapping.Status.ToString(); }
 }
 
 public sealed class SettingsViewModel : ViewModelBase

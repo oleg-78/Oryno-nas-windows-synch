@@ -11,6 +11,8 @@ using System.Windows.Media.Imaging;
 
 public partial class App : Application
 {
+    public static bool SampleMappings { get; private set; }
+    public static bool CleanupSampleMappings { get; private set; }
     public static readonly EventWaitHandle ActivateEvent = new(false, EventResetMode.AutoReset, "Local\\OrynoSync.Activate");
     private Mutex? _mutex;
     protected override void OnStartup(StartupEventArgs e)
@@ -18,6 +20,8 @@ public partial class App : Application
         _mutex = new Mutex(true, "Local\\OrynoSync.SingleInstance", out var first);
         if (!first) { try { using var signal = EventWaitHandle.OpenExisting("Local\\OrynoSync.Activate"); signal.Set(); } catch { } Shutdown(); return; }
         base.OnStartup(e); MainWindow = new MainWindow();
+        SampleMappings = e.Args.Any(x => x.Equals("--sample-mappings", StringComparison.OrdinalIgnoreCase));
+        CleanupSampleMappings = e.Args.Any(x => x.Equals("--cleanup-sample-mappings", StringComparison.OrdinalIgnoreCase));
         if (int.TryParse(e.Args.FirstOrDefault(x => x.StartsWith("--width=", StringComparison.OrdinalIgnoreCase))?["--width=".Length..], out var width)) MainWindow.Width = width;
         MainWindow.Show();
         var capture = e.Args.FirstOrDefault(x => x.StartsWith("--capture=", StringComparison.OrdinalIgnoreCase));
@@ -26,8 +30,8 @@ public partial class App : Application
             var path = capture["--capture=".Length..];
             Dispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.ApplicationIdle, new Action(async () =>
             {
-                await Task.Delay(1200); var window = (MainWindow)MainWindow; var page = e.Args.FirstOrDefault(x => x.StartsWith("--page=", StringComparison.OrdinalIgnoreCase))?["--page=".Length..]; if (Enum.TryParse<AppPage>(page, true, out var selectedPage)) window.SelectPage(selectedPage); window.UpdateLayout();
-                var bitmap = new RenderTargetBitmap((int)window.ActualWidth, (int)window.ActualHeight, 96, 96, PixelFormats.Pbgra32); bitmap.Render(window);
+                await Task.Delay(1200); var window = (MainWindow)MainWindow; var page = e.Args.FirstOrDefault(x => x.StartsWith("--page=", StringComparison.OrdinalIgnoreCase))?["--page=".Length..]; if (Enum.TryParse<AppPage>(page, true, out var selectedPage)) window.SelectPage(selectedPage); if(e.Args.Any(x=>x.Equals("--add-folder-dialog",StringComparison.OrdinalIgnoreCase))) window.ShowAddFolderDialogForCapture(); window.UpdateLayout();
+                var target = Application.Current.Windows.OfType<Window>().FirstOrDefault(w => w is AddFolderWindow && w.IsVisible) ?? window; target.UpdateLayout(); var bitmap = new RenderTargetBitmap((int)target.ActualWidth, (int)target.ActualHeight, 96, 96, PixelFormats.Pbgra32); bitmap.Render(target);
                 var encoder = new PngBitmapEncoder(); encoder.Frames.Add(BitmapFrame.Create(bitmap));
                 await using var stream = File.Create(path); encoder.Save(stream); window.Close();
             }));

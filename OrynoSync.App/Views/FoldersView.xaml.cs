@@ -5,6 +5,9 @@ namespace OrynoSync.App.Views;
 public partial class FoldersView : WpfUserControl
 {
     public FoldersView() => InitializeComponent();
-    private void ChangeFolder_Click(object sender, RoutedEventArgs e) => (DataContext as FoldersViewModel)?.ChangeFolder?.Invoke();
-    private void OpenFolder_Click(object sender, RoutedEventArgs e) => (DataContext as FoldersViewModel)?.OpenFolder?.Invoke();
+    private void AddFolder_Click(object sender, RoutedEventArgs e) => (DataContext as FoldersViewModel)?.AddFolder?.Invoke();
+    private static MappingCardViewModel? Mapping(object sender) => (sender as FrameworkElement)?.DataContext as MappingCardViewModel;
+    private void Open_Click(object sender, RoutedEventArgs e) => Mapping(sender)?.Open?.Invoke();
+    private void Pause_Click(object sender, RoutedEventArgs e) => Mapping(sender)?.Pause?.Invoke();
+    private void Remove_Click(object sender, RoutedEventArgs e) => Mapping(sender)?.Remove?.Invoke();
 }
