@@ -114,7 +114,7 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
 
     private async Task ApplyRemoteOnlyAsync(SyncMapping mapping, Guid rootId, IReadOnlyDictionary<string, RemoteItemState> remote, IReadOnlyDictionary<string, MappingLocalItem> local, CancellationToken ct)
     {
-        var pendingPaths = (await mappings.GetPendingAsync(mapping.MappingId, DateTimeOffset.UtcNow, ct)).Select(x => PathRules.NormalizeRelative(x.RelativePath)).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var pendingPaths = (await mappings.GetPendingAsync(mapping.MappingId, DateTimeOffset.MaxValue, ct)).Select(x => PathRules.NormalizeRelative(x.RelativePath)).ToHashSet(StringComparer.OrdinalIgnoreCase);
         foreach (var item in remote.Values.OrderBy(x => x.RelativePath.Count(c => c == '\\')))
         {
             if (!PathRules.IsWindowsCompatible(item.RelativePath)) { await RecordAsync(mapping, item.RelativePath, "Download", "Error", "invalid filename: Windows cannot materialize this path.", ct); continue; }
