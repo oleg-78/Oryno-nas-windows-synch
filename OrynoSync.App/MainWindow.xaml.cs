@@ -234,6 +234,11 @@ public partial class MainWindow : Window
             _foldersVm.Stats = $"{summary.IndexedFiles:N0} indexed · {summary.WaitingCount:N0} waiting · {summary.ErrorCount:N0} errors";
             _settingsVm.QueueLength = summary.WaitingCount.ToString("N0");
             SidebarSyncText.Text = summary.WaitingCount == 0 ? "Everything is up to date" : $"{summary.WaitingCount:N0} changes waiting safely";
+            StatusText.Text = summary.ErrorCount > 0
+                ? "Sync issues need attention"
+                : summary.WaitingCount > 0
+                    ? "Changes waiting safely"
+                    : "Up to date";
             UpdateTrayStatus();
         });
         return summary;
