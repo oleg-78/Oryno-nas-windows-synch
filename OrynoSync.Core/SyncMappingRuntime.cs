@@ -188,7 +188,7 @@ public sealed class SyncMappingRuntimeManager(ISyncMappingStore store)
 
                 var finalStatus = _mapping.ServerRootId is null
                     ? MappingStatus.ServerRootUnavailable
-                    : MappingStatus.WaitingForContentSupport;
+                    : MappingStatus.Syncing;
                 await UpdateStatusAsync(finalStatus, null, ct);
                 _progress(new ScanProgress(files, folders, changes, true));
             }

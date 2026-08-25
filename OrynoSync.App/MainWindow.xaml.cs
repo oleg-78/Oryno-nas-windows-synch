@@ -25,6 +25,7 @@ public partial class MainWindow : Window
     private HttpClient? _http;
     private OrynoNasSyncApi? _api;
     private MetadataSyncCoordinator? _metadata;
+    private MappingTransferCoordinator? _transfer;
     private Forms.NotifyIcon? _tray;
     private bool _paused;
     private bool _allowClose;
@@ -125,6 +126,8 @@ public partial class MainWindow : Window
         _api = new OrynoNasSyncApi(_http, uri);
         _metadata = new MetadataSyncCoordinator(_api, _remoteStore);
         _metadata.Progress += progress => Dispatcher.BeginInvoke(() => SetSyncStatus(progress.State, progress.Message));
+        _transfer = new MappingTransferCoordinator(_mappingStore, _remoteStore, _api, Path.Combine(_appData, "Transfers"));
+        _transfer.Activity += activity => Dispatcher.BeginInvoke(() => _activityVm.Add($"{activity.Timestamp.LocalDateTime:t}  {activity.RelativePath}  {activity.Action}"));
     }
 
     private HttpClient CreateHttpClient(Uri uri, Func<string, CancellationToken, Task<string?>> reader)
@@ -163,7 +166,15 @@ public partial class MainWindow : Window
                     await _metadata.RunCycleAsync(mapping.ServerRootId!.Value, ct);
                     await RefreshRemoteAsync(mapping.ServerRootId.Value, ct);
                 }
-                SetSyncStatus(EngineState.OnlineIdle, mappings.Count == 0 ? "Add a local folder to start syncing." : "Connected. Changes stay safely queued until content sync is available.");
+                if (_transfer is not null) await _transfer.ProcessAsync(mappings, ct);
+                foreach (var mapping in mappings.Where(x => x.Enabled && x.ServerRootId is not null))
+                {
+                    var pending = await _mappingStore.PendingCountAsync(mapping.MappingId, ct);
+                    var current = await _mappingStore.GetMappingAsync(mapping.MappingId, ct);
+                    if (current is not null && current.Status != MappingStatus.Paused)
+                        await _mappingStore.UpdateMappingAsync(current with { Status = pending == 0 ? MappingStatus.UpToDate : MappingStatus.Syncing, LastError = null, UpdatedAt = DateTimeOffset.UtcNow }, ct);
+                }
+                SetSyncStatus(EngineState.OnlineIdle, mappings.Count == 0 ? "Add a local folder to start syncing." : "Connected. Syncing files.");
                 await RefreshCountersAsync();
                 await Delay(4000, ct);
             }
