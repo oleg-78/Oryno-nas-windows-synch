@@ -9,11 +9,14 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
 
     public async Task ProcessAsync(IReadOnlyList<SyncMapping> allMappings, CancellationToken ct = default)
     {
+        // One transport operation per mapping per scheduler pass keeps a large
+        // queue from starving smaller mappings. The application calls this pass
+        // periodically, so the next pass naturally continues round-robin.
         foreach (var mapping in allMappings.Where(x => x.Enabled && x.ServerRootId is not null && x.Status != MappingStatus.Paused))
-            await ProcessMappingAsync(mapping, ct);
+            await ProcessMappingAsync(mapping, ct, 1);
     }
 
-    private async Task ProcessMappingAsync(SyncMapping mapping, CancellationToken ct)
+    private async Task ProcessMappingAsync(SyncMapping mapping, CancellationToken ct, int maxOperations)
     {
         var rootId = mapping.ServerRootId!.Value;
         var remote = (await remoteState.GetRemoteItemsAsync(rootId, ct)).Where(x => !x.IsDeleted).ToDictionary(x => x.RelativePath, StringComparer.OrdinalIgnoreCase);
@@ -30,7 +33,7 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
             await mappings.UpdateMappingAsync(mapping with { InventoryState = "Normalized", UpdatedAt = DateTimeOffset.UtcNow }, ct);
             pending = normalized.Where(x => x.State is OperationState.Pending or OperationState.Failed).ToArray();
         }
-        foreach (var operation in pending)
+        foreach (var operation in pending.Take(Math.Max(1, maxOperations)))
         {
             try { await ProcessOperationAsync(mapping, rootId, operation, remote, local, ct); }
             catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }

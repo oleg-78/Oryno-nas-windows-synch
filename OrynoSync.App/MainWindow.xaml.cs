@@ -465,7 +465,8 @@ public partial class MainWindow : Window
         _paused = !_paused;
         _activityVm.IsPaused = _paused;
         SetSyncStatus(_paused ? EngineState.Paused : EngineState.Connecting, _paused ? "Sync paused" : "Resuming...");
-        if (!_paused) RestartRemoteLoop();
+        if (_paused) _remoteCts?.Cancel();
+        else RestartRemoteLoop();
     }
 
     private void OpenFolder_Click()
