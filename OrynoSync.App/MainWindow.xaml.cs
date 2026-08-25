@@ -177,8 +177,11 @@ public partial class MainWindow : Window
                     if (current is not null && current.Status != MappingStatus.Paused)
                         await _mappingStore.UpdateMappingAsync(current with { Status = pending == 0 ? MappingStatus.UpToDate : MappingStatus.Syncing, LastError = null, UpdatedAt = DateTimeOffset.UtcNow }, ct);
                 }
-                SetSyncStatus(EngineState.OnlineIdle, mappings.Count == 0 ? "Add a local folder to start syncing." : "Connected. Syncing files.");
-                await RefreshCountersAsync();
+                var summary = await RefreshCountersAsync();
+                if (mappings.Count == 0) SetSyncStatus(EngineState.OnlineIdle, "Add a local folder to start syncing.");
+                else if (summary.ErrorCount > 0) SetSyncStatus(EngineState.Error, "Sync issues need attention");
+                else if (summary.WaitingCount > 0) SetSyncStatus(EngineState.Syncing, "Changes waiting safely");
+                else SetSyncStatus(EngineState.UpToDate, "Up to date");
                 await Delay(4000, ct);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
@@ -218,7 +221,7 @@ public partial class MainWindow : Window
         await Dispatcher.InvokeAsync(() => _foldersVm.Stats = $"Remote metadata: {count:N0} items - Waiting for content: {downloads:N0} - Revision: {state.LastRevision:N0}");
     }
 
-    private async Task RefreshCountersAsync()
+    private async Task<SyncDashboardSummary> RefreshCountersAsync()
     {
         var summary = await _mappingStore.GetDashboardSummaryAsync();
         var mappingSummaries = await _mappingStore.GetMappingSummariesAsync();
@@ -233,6 +236,7 @@ public partial class MainWindow : Window
             SidebarSyncText.Text = summary.WaitingCount == 0 ? "Everything is up to date" : $"{summary.WaitingCount:N0} changes waiting safely";
             UpdateTrayStatus();
         });
+        return summary;
     }
 
     private void SetConnection(ConnectionResult result, int failures)
@@ -327,6 +331,7 @@ public partial class MainWindow : Window
             {
                 card.Open = () => OpenMapping(card.LocalPath);
                 card.Pause = () => ToggleMappingPause(card);
+                card.Rebuild = () => RebuildMapping(card.Mapping);
                 card.Remove = () => RemoveMapping(card.Mapping);
             }
         });
@@ -348,8 +353,23 @@ public partial class MainWindow : Window
         if (System.Windows.MessageBox.Show(this, $"Stop syncing {mapping.LocalPath}?\n\nFiles on Windows and Oryno NAS will not be deleted.",
             "Remove from Oryno Sync", System.Windows.MessageBoxButton.YesNo, System.Windows.MessageBoxImage.Warning) != System.Windows.MessageBoxResult.Yes) return;
         _mappingRuntime.Stop(mapping.MappingId);
-        await _mappingStore.RemoveMappingAsync(mapping.MappingId);
+        if (_transfer is not null) await _transfer.RemoveMappingAsync(mapping);
+        else await _mappingStore.RemoveMappingAsync(mapping.MappingId);
         await RefreshMappingsAsync();
+    }
+
+    private async void RebuildMapping(SyncMapping mapping)
+    {
+        if (_transfer is null || mapping.ServerRootId is null) { System.Windows.MessageBox.Show(this, "Select an Oryno NAS folder before rebuilding sync state.", "NAS folder required", System.Windows.MessageBoxButton.OK, System.Windows.MessageBoxImage.Information); return; }
+        _mappingRuntime.Stop(mapping.MappingId);
+        try
+        {
+            var result = await _transfer.RebuildAsync(mapping);
+            await RefreshMappingsAsync();
+            await _mappingRuntime.StartAsync(await _mappingStore.GetMappingAsync(mapping.MappingId) ?? mapping);
+            AddActivity($"Sync state rebuilt: {result.OldPendingCount:N0} old changes → {result.NormalizedPendingCount:N0} current operations");
+        }
+        catch (Exception ex) { System.Windows.MessageBox.Show(this, ex.Message, "Unable to rebuild sync state", System.Windows.MessageBoxButton.OK, System.Windows.MessageBoxImage.Error); }
     }
 
     private async void AddFolder()
@@ -365,13 +385,20 @@ public partial class MainWindow : Window
         }
         if (dialog.SelectedRoot is not null && existing.Any(x => x.ServerRootId == dialog.SelectedRoot.RootId))
         {
-            System.Windows.MessageBox.Show(this, "This Oryno NAS root is already mapped on this device.", "NAS folder already mapped", System.Windows.MessageBoxButton.OK, System.Windows.MessageBoxImage.Information);
+            var current = existing.First(x => x.ServerRootId == dialog.SelectedRoot.RootId);
+            System.Windows.MessageBox.Show(this, $"This NAS folder is already linked.\n\nNAS root: {dialog.SelectedRoot.Name}\nExisting local path: {current.LocalPath}", "NAS folder already mapped", System.Windows.MessageBoxButton.OK, System.Windows.MessageBoxImage.Information);
             return;
         }
         var now = DateTimeOffset.UtcNow;
         var mapping = new SyncMapping(Guid.NewGuid(), dialog.LocalPath, dialog.SelectedRoot?.RootId, dialog.SelectedRoot?.Name, true,
             now, now, null, "NotStarted", null, null, dialog.SelectedRoot is null ? MappingStatus.ServerRootUnavailable : MappingStatus.Scanning);
-        await _mappingStore.AddMappingAsync(mapping);
+        try { await _mappingStore.AddMappingAsync(mapping); }
+        catch (MappingAlreadyLinkedException)
+        {
+            var current = existing.FirstOrDefault(x => x.ServerRootId == mapping.ServerRootId);
+            System.Windows.MessageBox.Show(this, $"This NAS folder is already linked.\n\nNAS root: {mapping.ServerRootName}\nExisting local path: {current?.LocalPath ?? "another mapping"}", "NAS folder already mapped", System.Windows.MessageBoxButton.OK, System.Windows.MessageBoxImage.Information);
+            return;
+        }
         if (mapping.ServerRootId is Guid selectedRoot)
         {
             _selectedRootId = selectedRoot;

@@ -58,6 +58,7 @@ public interface ICredentialStore { Task SaveAsync(string account, string secret
 public interface IContentHasher { Task<string> ComputeAsync(string path, CancellationToken ct = default); }
 public interface IAtomicFileWriter { Task ReplaceAsync(string targetPath, Stream content, string expectedHash, CancellationToken ct = default); }
 public sealed class ServerCapabilityException(string capability) : Exception($"Server capability is unavailable: {capability}") { public string Capability { get; } = capability; }
+public sealed class MappingAlreadyLinkedException(Guid rootId) : Exception("This NAS folder is already linked.") { public Guid RootId { get; } = rootId; }
 public sealed class SyncApiException(System.Net.HttpStatusCode status, string code, string message) : Exception(message) { public System.Net.HttpStatusCode Status { get; } = status; public string Code { get; } = code; }
 public static class PathRules
 {

@@ -10,4 +10,5 @@ public partial class FoldersView : WpfUserControl
     private void Open_Click(object sender, RoutedEventArgs e) => Mapping(sender)?.Open?.Invoke();
     private void Pause_Click(object sender, RoutedEventArgs e) => Mapping(sender)?.Pause?.Invoke();
     private void Remove_Click(object sender, RoutedEventArgs e) => Mapping(sender)?.Remove?.Invoke();
+    private void Rebuild_Click(object sender, RoutedEventArgs e) => Mapping(sender)?.Rebuild?.Invoke();
 }

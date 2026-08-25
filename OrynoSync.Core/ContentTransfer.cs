@@ -22,7 +22,7 @@ public sealed class Blake3ContentHasher : IContentHasher
     }
 }
 
-public sealed record UploadTarget(Guid RootId, Guid? ParentItemId, string Name, Guid? ItemId = null, long? BaseVersion = null, Guid? OperationId = null);
+public sealed record UploadTarget(Guid RootId, Guid? ParentItemId, string Name, Guid? ItemId = null, long? BaseVersion = null, Guid? OperationId = null, Guid? MappingId = null);
 public sealed record DownloadTarget(Guid ItemId, long Version, string RelativePath, long ExpectedSize, string ExpectedHash, DateTimeOffset? ExpectedMtime = null);
 public sealed record TransferResult(Guid? ItemId, long? Version, long Bytes, string Hash, bool Resumed, bool Replayed = false);
 
@@ -55,7 +55,7 @@ public sealed class ResumableTransferClient(IContentTransferApi api, string temp
                 catch (SyncApiException e) when (e.Code == "SYNC_UPLOAD_NOT_FOUND") { session = await CreateAsync(); }
             }
             else session = await CreateAsync();
-            if (_sessions is not null) await _sessions.SaveAsync(key, session.UploadId, before.Length, expectedHash, ct);
+            if (_sessions is not null) await _sessions.SaveAsync(key, session.UploadId, before.Length, expectedHash, target.MappingId, ct);
             var status = await api.GetUploadStatusAsync(session.UploadId, ct);
             var offset = Math.Clamp(status.ReceivedBytes, 0, before.Length);
             var resumed = offset > 0;

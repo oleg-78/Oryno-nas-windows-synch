@@ -2,10 +2,35 @@ namespace OrynoSync.Core;
 
 public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemoteStateStore remoteState, IContentTransferApi api, string tempRoot)
 {
+    private readonly SqliteTransferSessionStore _sessions = new(Path.Combine(tempRoot, "transfer-state.db"));
     private readonly ResumableTransferClient _transfers = new(api, tempRoot, 3, new SqliteTransferSessionStore(Path.Combine(tempRoot, "transfer-state.db")));
     private readonly SemaphoreSlim _hashGate = new(2);
     private readonly IContentHasher _hasher = new Blake3ContentHasher();
     public event Action<SyncActivityEvent>? Activity;
+
+    public async Task RemoveMappingAsync(SyncMapping mapping, CancellationToken ct = default)
+    {
+        await mappings.RemoveMappingAsync(mapping.MappingId, ct);
+        await _sessions.RemoveForMappingAsync(mapping.MappingId, ct);
+        if (mapping.ServerRootId is Guid rootId) await remoteState.RemoveRootStateAsync(rootId, ct);
+    }
+
+    public async Task<QueueNormalizationResult> RebuildAsync(SyncMapping mapping, CancellationToken ct = default)
+    {
+        if (mapping.ServerRootId is not Guid rootId) throw new InvalidOperationException("Select an Oryno NAS folder before rebuilding sync state.");
+        var remote = (await remoteState.GetRemoteItemsAsync(rootId, ct)).Where(x => !x.IsDeleted).ToArray();
+        var oldPending = await mappings.GetPendingAsync(mapping.MappingId, DateTimeOffset.MaxValue, ct);
+        var desired = await SnapshotAsync(mapping.LocalPath, ct);
+        var plan = QueueNormalizer.Plan(desired, remote, oldPending);
+        var normalized = plan.Conflicts.Select(path => new MappingPendingOperation(Guid.NewGuid(), mapping.MappingId, OperationType.Conflict, path, null, DateTimeOffset.UtcNow, 0, DateTimeOffset.MaxValue, OperationState.Failed, "SYNC_CONFLICT: local and NAS content differ.")).ToList();
+        normalized.AddRange(plan.Operations.Select(operation => new MappingPendingOperation(Guid.NewGuid(), mapping.MappingId, operation.Type, operation.RelativePath, null, DateTimeOffset.UtcNow, 0, DateTimeOffset.UtcNow, OperationState.Pending, null)));
+        var remoteByPath = remote.ToDictionary(x => x.RelativePath, StringComparer.OrdinalIgnoreCase);
+        var items = desired.Select(item => new MappingLocalItem(mapping.MappingId, item.RelativePath, item.ItemType, item.Size, item.Mtime, item.ItemType == ItemType.File && remoteByPath.TryGetValue(item.RelativePath, out var r) && string.Equals(item.ContentHash, r.ContentHash, StringComparison.OrdinalIgnoreCase) ? SyncItemState.Synced : SyncItemState.Waiting)).ToArray();
+        await mappings.ReplaceItemsAsync(mapping.MappingId, items, ct);
+        await mappings.ReplacePendingAsync(mapping.MappingId, normalized, ct);
+        await mappings.UpdateMappingAsync(mapping with { InventoryState = "Normalized", Status = normalized.Count == 0 ? MappingStatus.UpToDate : MappingStatus.Syncing, UpdatedAt = DateTimeOffset.UtcNow }, ct);
+        return plan;
+    }
 
     public async Task ProcessAsync(IReadOnlyList<SyncMapping> allMappings, CancellationToken ct = default)
     {
@@ -79,7 +104,7 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
                 if (existing is not null && string.Equals(existing.ContentHash, hash, StringComparison.OrdinalIgnoreCase)) { }
                 else
                 {
-                    var result = await _transfers.UploadAsync(path, new UploadTarget(rootId, FindParent(remote, rel), Path.GetFileName(rel), existing?.ItemId, existing?.Version, op.OperationId), ct);
+                    var result = await _transfers.UploadAsync(path, new UploadTarget(rootId, FindParent(remote, rel), Path.GetFileName(rel), existing?.ItemId, existing?.Version, op.OperationId, mapping.MappingId), ct);
                     await mappings.UpsertItemAsync(new(mapping.MappingId, rel, ItemType.File, info.Length, info.LastWriteTimeUtc, SyncItemState.Synced), ct);
                     await RecordAsync(mapping, rel, "Uploaded", "Synced", null, ct);
                     _ = result;
