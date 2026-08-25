@@ -13,6 +13,9 @@
     <UseWindowsForms>true</UseWindowsForms>
     <ApplicationIcon>Assets\OrynoSync.ico</ApplicationIcon>
   </PropertyGroup>
-  <ItemGroup><Resource Include="Assets\OrynoSync.ico" /></ItemGroup>
+  <ItemGroup>
+    <Resource Include="Assets\OrynoSync.ico" />
+    <None Include="..\Logo-NAS.png" Link="Logo-NAS.png" />
+  </ItemGroup>
 
 </Project>

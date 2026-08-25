@@ -27,6 +27,9 @@ public partial class MainWindow : Window
     private MetadataSyncCoordinator? _metadata;
     private MappingTransferCoordinator? _transfer;
     private Forms.NotifyIcon? _tray;
+    private Forms.ToolStripMenuItem? _trayStatus;
+    private Forms.ToolStripMenuItem? _trayPause;
+    private Forms.ToolStripMenuItem? _traySyncNow;
     private bool _paused;
     private bool _allowClose;
     private int _failures;
@@ -228,6 +231,7 @@ public partial class MainWindow : Window
             _foldersVm.Stats = $"{summary.IndexedFiles:N0} indexed · {summary.WaitingCount:N0} waiting · {summary.ErrorCount:N0} errors";
             _settingsVm.QueueLength = summary.WaitingCount.ToString("N0");
             SidebarSyncText.Text = summary.WaitingCount == 0 ? "Everything is up to date" : $"{summary.WaitingCount:N0} changes waiting safely";
+            UpdateTrayStatus();
         });
     }
 
@@ -275,7 +279,7 @@ public partial class MainWindow : Window
             _activityVm.Status = label;
             _activityVm.ConnectionMessage = message;
             _activityVm.ConnectionTone = tone;
-            if (_tray is not null) _tray.Text = $"Oryno Sync - {label}";
+            UpdateTrayStatus();
         });
         if (state is ConnectionState.ServerUnavailable or ConnectionState.Reconnecting)
             SetSyncStatus(EngineState.Offline, "Offline - local changes are safe");
@@ -285,7 +289,7 @@ public partial class MainWindow : Window
     {
         var label = state switch
         {
-            EngineState.OnlineIdle or EngineState.UpToDate => message.Contains("content", StringComparison.OrdinalIgnoreCase) ? "Waiting for server content sync" : "Up to date",
+            EngineState.OnlineIdle or EngineState.UpToDate => message.Contains("sync", StringComparison.OrdinalIgnoreCase) ? "Syncing files..." : "Up to date",
             EngineState.InitialInventory or EngineState.Reconciling => "Updating metadata...",
             EngineState.SyncingMetadata or EngineState.Syncing => "Syncing metadata...",
             EngineState.Paused => "Sync paused",
@@ -465,6 +469,7 @@ public partial class MainWindow : Window
         _paused = !_paused;
         _activityVm.IsPaused = _paused;
         SetSyncStatus(_paused ? EngineState.Paused : EngineState.Connecting, _paused ? "Sync paused" : "Resuming...");
+        UpdateTrayStatus();
         if (_paused) _remoteCts?.Cancel();
         else RestartRemoteLoop();
     }
@@ -477,23 +482,59 @@ public partial class MainWindow : Window
 
     private void SetupTray()
     {
-        _tray = new Forms.NotifyIcon { Icon = LoadAppIcon(), Text = "Oryno Sync", Visible = true };
+        _tray = new Forms.NotifyIcon { Icon = LoadAppIcon(), Text = "Oryno Sync — Starting", Visible = true };
         var menu = new Forms.ContextMenuStrip();
-        menu.Items.Add("Oryno Sync");
+        _trayStatus = new Forms.ToolStripMenuItem("Oryno Sync — Starting") { Enabled = false };
+        _traySyncNow = new Forms.ToolStripMenuItem("Sync now", null, (_, _) => { if (!_paused) RestartRemoteLoop(); });
+        _trayPause = new Forms.ToolStripMenuItem("Pause syncing", null, (_, _) => TogglePause());
+        menu.Items.Add(_trayStatus);
         menu.Items.Add("Open Oryno Sync", null, (_, _) => ShowFromTray());
-        menu.Items.Add("Pause syncing", null, (_, _) => TogglePause());
-        menu.Items.Add("Exit", null, (_, _) => { _allowClose = true; Close(); });
+        menu.Items.Add(_traySyncNow);
+        menu.Items.Add(_trayPause);
+        menu.Items.Add(new Forms.ToolStripSeparator());
+        menu.Items.Add("Exit Oryno Sync", null, (_, _) => { _allowClose = true; Close(); });
         _tray.ContextMenuStrip = menu;
         _tray.DoubleClick += (_, _) => ShowFromTray();
+        UpdateTrayStatus();
     }
 
     private static System.Drawing.Icon LoadAppIcon()
     {
-        try { return System.Drawing.Icon.ExtractAssociatedIcon(Environment.ProcessPath!) ?? System.Drawing.SystemIcons.Application; }
+        try
+        {
+            var resource = System.Windows.Application.GetResourceStream(new Uri("Assets/OrynoSync.ico", UriKind.Relative));
+            if (resource is not null)
+            {
+                using var stream = new MemoryStream();
+                resource.Stream.CopyTo(stream);
+                stream.Position = 0;
+                using var icon = new System.Drawing.Icon(stream);
+                return (System.Drawing.Icon)icon.Clone();
+            }
+            return System.Drawing.Icon.ExtractAssociatedIcon(Environment.ProcessPath!) ?? System.Drawing.SystemIcons.Application;
+        }
         catch { return System.Drawing.SystemIcons.Application; }
     }
 
-    private void ShowFromTray() { Show(); WindowState = WindowState.Normal; Activate(); }
+    private void ShowFromTray() { Show(); WindowState = WindowState.Normal; Activate(); Topmost = true; Topmost = false; }
+
+    private void UpdateTrayStatus()
+    {
+        if (_tray is null) return;
+        var status = _paused ? "Paused" : _connectionTracker.State switch
+        {
+            ConnectionState.Connected when _activityVm.ErrorsText != "0" => "Errors",
+            ConnectionState.Connected when _activityVm.WaitingText != "0" => "Syncing",
+            ConnectionState.Connected => "Up to date",
+            ConnectionState.AuthenticationRequired or ConnectionState.AuthenticationExpired or ConnectionState.ServerUnavailable => "Disconnected",
+            _ => "Connecting"
+        };
+        var text = $"Oryno Sync — {status}";
+        _tray.Text = text.Length > 63 ? text[..63] : text;
+        if (_trayStatus is not null) _trayStatus.Text = text;
+        if (_trayPause is not null) _trayPause.Text = _paused ? "Resume syncing" : "Pause syncing";
+        if (_traySyncNow is not null) _traySyncNow.Enabled = !_paused;
+    }
 
     private void Window_Closing(object? sender, System.ComponentModel.CancelEventArgs e)
     {
