@@ -32,7 +32,7 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
         var items = desired.Select(item => new MappingLocalItem(mapping.MappingId, item.RelativePath, item.ItemType, item.Size, item.Mtime, item.ItemType == ItemType.File && remoteByPath.TryGetValue(item.RelativePath, out var r) && string.Equals(item.ContentHash, r.ContentHash, StringComparison.OrdinalIgnoreCase) ? SyncItemState.Synced : SyncItemState.Waiting)).ToArray();
         await mappings.ReplaceItemsAsync(mapping.MappingId, items, ct);
         await mappings.ReplacePendingAsync(mapping.MappingId, normalized, ct);
-        await mappings.UpdateMappingAsync(mapping with { InventoryState = "Normalized", Status = normalized.Count == 0 ? MappingStatus.UpToDate : MappingStatus.ReadyForPreflight, UpdatedAt = DateTimeOffset.UtcNow }, ct);
+        await mappings.UpdateMappingAsync(mapping with { InventoryState = "Normalized", Status = normalized.Count == 0 ? MappingStatus.UpToDate : MappingStatus.ReadyToSync, UpdatedAt = DateTimeOffset.UtcNow }, ct);
         return plan;
     }
 
@@ -73,10 +73,9 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
             await mappings.UpdateMappingAsync(mapping with { InventoryState = "Normalized", UpdatedAt = DateTimeOffset.UtcNow }, ct);
             pending = normalized.Where(x => x.State is OperationState.Pending or OperationState.Failed).ToArray();
         }
-        // Preflight mode (dest picked, queue rebuilt) must not start transfers:
-        // the desired-state plan exists, but no operation is executed until the
-        // user explicitly leaves ReadyForPreflight.
-        if (mapping.Status == MappingStatus.ReadyForPreflight) return;
+        // Preflight modes (ReadyForPreflight, ReadyToSync): plan exists, but no
+        // transfers run until the user explicitly approves via StartSync.
+        if (mapping.Status == MappingStatus.ReadyForPreflight || mapping.Status == MappingStatus.ReadyToSync) return;
         foreach (var operation in pending.Take(Math.Max(1, maxOperations)))
         {
             try { await ProcessOperationAsync(mapping, rootId, operation, remote, local, ct); }

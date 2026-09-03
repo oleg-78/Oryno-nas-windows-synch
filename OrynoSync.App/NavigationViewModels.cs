@@ -31,7 +31,25 @@ public sealed class FoldersViewModel : ViewModelBase
     public string LocalFolder { get => _localFolder; set => Set(ref _localFolder, value); } public string RootName { get => _rootName; set => Set(ref _rootName, value); } public string LocalStatus { get => _localStatus; set => Set(ref _localStatus, value); } public string Stats { get => _stats; set => Set(ref _stats, value); }
     public Action? ChangeFolder { get; set; } public Action? OpenFolder { get; set; } public Action? AddFolder { get; set; } public IReadOnlyList<SyncRootDto> Roots { get; private set; } = []; public ObservableCollection<MappingCardViewModel> Mappings { get; } = [];
     public void SetRoots(IReadOnlyList<SyncRootDto> roots, Guid? selected) { Roots = roots; RootName = selected is Guid id ? roots.FirstOrDefault(x => x.RootId == id)?.Name ?? "Selected root unavailable" : roots.Count == 0 ? "Unavailable while server is offline" : "Select a sync root"; Raise(nameof(Roots)); }
-    public void SetMappings(IReadOnlyList<SyncMapping> mappings) { Mappings.Clear(); foreach (var mapping in mappings) Mappings.Add(new MappingCardViewModel(mapping)); }
+    public void SetMappings(IReadOnlyList<SyncMapping> mappings)
+    {
+        // Incremental update: preserve existing card identity by mapping_id.
+        // Prevents UI flicker from full card recreation every polling cycle.
+        var existing = Mappings.ToDictionary(x => x.MappingId);
+        var seen = new HashSet<Guid>();
+        foreach (var mapping in mappings)
+        {
+            seen.Add(mapping.MappingId);
+            if (existing.TryGetValue(mapping.MappingId, out var card))
+                card.Apply(mapping);
+            else
+                Mappings.Add(new MappingCardViewModel(mapping));
+        }
+        // Remove cards no longer present
+        for (int i = Mappings.Count - 1; i >= 0; i--)
+            if (!seen.Contains(Mappings[i].MappingId))
+                Mappings.RemoveAt(i);
+    }
     public void ApplyMapping(SyncMapping mapping, ScanProgress? progress = null) { var card = Mappings.FirstOrDefault(x => x.MappingId == mapping.MappingId); if (card is null) { Mappings.Add(new MappingCardViewModel(mapping)); card = Mappings[^1]; } card.Apply(mapping, progress); }
     public void ApplySummaries(IReadOnlyList<SyncMappingSummary> summaries) { foreach (var summary in summaries) Mappings.FirstOrDefault(x => x.MappingId == summary.MappingId)?.ApplySummary(summary); }
 }
@@ -39,8 +57,12 @@ public sealed class FoldersViewModel : ViewModelBase
 public sealed class MappingCardViewModel : ViewModelBase
 {
     private SyncMapping _mapping; private string _status = "Offline", _pending = "0 changes waiting", _rootName = "NAS folder not selected", _indexed = "0 indexed", _errors = "0 errors", _lastSync = "Last sync: Never"; private bool _paused, _isScanning;
-    public SyncMapping Mapping => _mapping; public Guid MappingId => _mapping.MappingId; public string LocalPath => _mapping.LocalPath; public string RootName { get => _rootName; set => Set(ref _rootName, value); } public string Status { get => _status; set => Set(ref _status, value); } public string PendingText { get => _pending; set => Set(ref _pending, value); } public string IndexedText { get => _indexed; set => Set(ref _indexed, value); } public string ErrorsText { get => _errors; set => Set(ref _errors, value); } public string LastSyncText { get => _lastSync; set => Set(ref _lastSync, value); } public bool IsPaused { get => _paused; set => Set(ref _paused, value); } public bool IsScanning { get => _isScanning; private set => Set(ref _isScanning, value); }
-    public Action? Open { get; set; } public Action? Pause { get; set; } public Action? Remove { get; set; } public Action? Rebuild { get; set; } public Action? Repair { get; set; } public Action? CreateRoot { get; set; } public Action? RefreshRoots { get; set; } public MappingCardViewModel(SyncMapping mapping) { _mapping = mapping; Apply(mapping); }
+    public SyncMapping Mapping => _mapping; public Guid MappingId => _mapping.MappingId; public string LocalPath => _mapping.LocalPath; public string RootName { get => _rootName; set => Set(ref _rootName, value); } public string Status { get => _status; set => Set(ref _status, value); } public string PendingText { get => _pending; set => Set(ref _pending, value); } public string IndexedText { get => _indexed; set => Set(ref _indexed, value); } public string ErrorsText { get => _errors; set => Set(ref _errors, value); } public string LastSyncText { get => _lastSync; set => Set(ref _lastSync, value); } public bool IsScanning { get => _isScanning; private set => Set(ref _isScanning, value); }
+    public Action? Open { get; set; } public Action? Pause { get; set; } public Action? Remove { get; set; } public Action? Rebuild { get; set; } public Action? Repair { get; set; } public Action? CreateRoot { get; set; } public Action? RefreshRoots { get; set; } public Action? ChooseDestination { get; set; } public Action? StartSync { get; set; } public Action? ReviewPlan { get; set; }
+    public bool IsPreflight => _mapping.Status == MappingStatus.ReadyForPreflight || _mapping.Status == MappingStatus.ReadyToSync;
+    public bool IsSyncing => _mapping.Status == MappingStatus.Syncing;
+    public bool IsPaused => _mapping.Status == MappingStatus.Paused;
+    public bool CanStartSync => _mapping.Status == MappingStatus.ReadyForPreflight || _mapping.Status == MappingStatus.ReadyToSync; public MappingCardViewModel(SyncMapping mapping) { _mapping = mapping; Apply(mapping); }
     public void Apply(SyncMapping mapping, ScanProgress? progress = null) { _mapping = mapping; Raise(nameof(Mapping)); Raise(nameof(LocalPath)); RootName = FormatRootName(mapping); var status = progress?.IsComplete == true && mapping.Status == MappingStatus.Scanning ? mapping.ServerRootId is null ? MappingStatus.ServerRootUnavailable : MappingStatus.Syncing : mapping.Status; Status = FriendlyStatus(status); IsScanning = mapping.Status == MappingStatus.Scanning || progress is not null && !progress.IsComplete; if (progress is not null) PendingText = progress.IsComplete ? $"{progress.FilesFound:N0} files indexed locally" : $"Scanning... {progress.FilesFound:N0} files found"; }
     public static string FormatRootName(SyncMapping mapping) => mapping.ServerRootName is null ? "Choose an Oryno NAS folder" : string.IsNullOrEmpty(mapping.ServerDestinationRelativePath) ? mapping.ServerRootName : $"{mapping.ServerRootName} / {mapping.ServerDestinationRelativePath.Replace('\\', '/')}";
     public void ApplySummary(SyncMappingSummary s) { IndexedText = $"{s.IndexedFiles:N0} indexed"; PendingText = s.WaitingCount == 0 ? "No changes waiting" : $"{s.WaitingCount:N0} changes waiting"; ErrorsText = $"{s.ErrorCount:N0} errors"; LastSyncText = s.LastSuccessfulFileSync is null ? "Last sync: Never" : $"Last sync: {s.LastSuccessfulFileSync.Value.LocalDateTime:g}"; ApplySummaryStatus(s); }
@@ -50,12 +72,13 @@ public sealed class MappingCardViewModel : ViewModelBase
         // Honest statuses (#10/#13): never claim "Syncing files..." unless the engine
         // is actually applying transfers; preflight mode is "Ready for preflight".
         if (_mapping.Status == MappingStatus.ReadyForPreflight) { Status = "Ready for preflight"; return; }
+        if (_mapping.Status == MappingStatus.ReadyToSync) { Status = "Ready to sync"; return; }
         if (_mapping.Status == MappingStatus.Paused) { Status = "Paused"; return; }
         if (s.ErrorCount > 0) { Status = "Sync issues"; return; }
         if (s.WaitingCount > 0) { Status = _mapping.Status == MappingStatus.Syncing ? "Syncing files..." : "Changes waiting"; return; }
         Status = "Up to date";
     }
-    private static string FriendlyStatus(MappingStatus status) => status switch { MappingStatus.Scanning => "Scanning...", MappingStatus.Syncing => "Syncing files...", MappingStatus.UpToDate => "Up to date", MappingStatus.WaitingForContentSupport => "Syncing files...", MappingStatus.ServerRootUnavailable => "Needs attention: NAS destination missing", MappingStatus.LocalFolderUnavailable => "Folder unavailable", MappingStatus.Paused => "Paused", MappingStatus.AuthenticationRequired => "Sign in required", MappingStatus.Conflict => "Conflicts need attention", MappingStatus.Error => "Unable to sync this folder", MappingStatus.Offline => "Offline - local changes are safe", MappingStatus.ReadyForPreflight => "Ready for preflight", _ => "Waiting to sync" };
+    private static string FriendlyStatus(MappingStatus status) => status switch { MappingStatus.Scanning => "Scanning...", MappingStatus.Syncing => "Syncing files...", MappingStatus.UpToDate => "Up to date", MappingStatus.WaitingForContentSupport => "Syncing files...", MappingStatus.ServerRootUnavailable => "Needs attention: NAS destination missing", MappingStatus.LocalFolderUnavailable => "Folder unavailable", MappingStatus.Paused => "Paused", MappingStatus.AuthenticationRequired => "Sign in required", MappingStatus.Conflict => "Conflicts need attention", MappingStatus.Error => "Unable to sync this folder", MappingStatus.Offline => "Offline - local changes are safe", MappingStatus.ReadyForPreflight => "Ready for preflight", MappingStatus.ReadyToSync => "Ready to sync", _ => "Waiting to sync" };
 }
 
 public sealed class SettingsViewModel : ViewModelBase

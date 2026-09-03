@@ -4,3 +4,15 @@
 *.user
 *.suo
 artifacts-*.png
+
+_build*_out.txt
+_test*_out.txt
+_b.txt
+_f.txt
+_t.txt
+_testout/
+_testout2/
+
+_verify/
+artifacts/
+test_output.txt

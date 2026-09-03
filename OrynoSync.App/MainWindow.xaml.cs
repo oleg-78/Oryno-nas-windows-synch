@@ -170,12 +170,12 @@ public partial class MainWindow : Window
                 {
                     var pending = await _mappingStore.PendingCountAsync(mapping.MappingId, ct);
                     var current = await _mappingStore.GetMappingAsync(mapping.MappingId, ct);
-                    if (current is not null && current.Status != MappingStatus.Paused && current.Status != MappingStatus.ReadyForPreflight)
+                    if (current is not null && current.Status != MappingStatus.Paused && current.Status != MappingStatus.ReadyForPreflight && current.Status != MappingStatus.ReadyToSync)
                         await _mappingStore.UpdateMappingAsync(current with { Status = pending == 0 ? MappingStatus.UpToDate : MappingStatus.Syncing, LastError = null, UpdatedAt = DateTimeOffset.UtcNow }, ct);
                 }
                 var summary = await RefreshCountersAsync();
-                var preflight = mappings.Any(x => x.Status == MappingStatus.ReadyForPreflight);
-                if (preflight) SetSyncStatus(EngineState.OnlineIdle, "Ready for preflight");
+                var preflight = mappings.Any(x => x.Status == MappingStatus.ReadyForPreflight || x.Status == MappingStatus.ReadyToSync);
+                if (preflight) SetSyncStatus(EngineState.OnlineIdle, "Ready to sync");
                 else if (mappings.Count == 0) SetSyncStatus(EngineState.OnlineIdle, "Add a local folder to start syncing.");
                 else if (summary.ErrorCount > 0) SetSyncStatus(EngineState.Error, "Sync issues need attention");
                 else if (summary.WaitingCount > 0) SetSyncStatus(EngineState.Syncing, "Changes waiting safely");
@@ -308,7 +308,7 @@ public partial class MainWindow : Window
     {
         var label = state switch
         {
-            EngineState.OnlineIdle or EngineState.UpToDate => message == "Ready for preflight" ? "Ready for preflight" : "Up to date",
+            EngineState.OnlineIdle or EngineState.UpToDate => message == "Ready to sync" ? "Ready to sync" : message == "Ready for preflight" ? "Ready for preflight" : "Up to date",
             EngineState.InitialInventory or EngineState.Reconciling => "Updating metadata...",
             EngineState.SyncingMetadata or EngineState.Syncing => "Syncing metadata...",
             EngineState.Paused => "Sync paused",
@@ -351,6 +351,9 @@ public partial class MainWindow : Window
                 card.Repair = () => RepairMapping(card.Mapping);
                 card.CreateRoot = () => CreateNasFolderForMapping(card.Mapping);
                 card.RefreshRoots = () => _ = RefreshRootsAsync();
+                card.ChooseDestination = () => ChooseDestinationAsync(card.Mapping);
+                card.StartSync = () => _ = StartSyncAsync(card.Mapping);
+                card.ReviewPlan = () => ReviewPlanAsync(card.Mapping);
             }
         });
     }
@@ -400,18 +403,7 @@ public partial class MainWindow : Window
     private async void RepairMapping(SyncMapping mapping)
     {
         if (mapping.ServerRootId is not null) { await RefreshRootsAsync(); return; }
-        var dialog = new AddFolderWindow(_foldersVm.Roots, RefreshRootsAsync, (rootId, parent, name) => _ = CreateNasFolderViaAsync(rootId, parent, name), LoadInventoryAsync, mapping.LocalPath, destinationOnly: true) { Owner = this, Title = "Choose NAS destination" };
-        if (dialog.ShowDialog() != true || dialog.SelectedRoot is not SyncRootDto root) return;
-        var current = await _mappingStore.GetMappingAsync(mapping.MappingId);
-        if (current is null) return;
-        var other = (await _mappingStore.GetMappingsAsync()).FirstOrDefault(x => x.MappingId != mapping.MappingId && x.ServerRootId == root.RootId);
-        if (other is not null) { System.Windows.MessageBox.Show(this, $"This NAS folder is already linked to {other.LocalPath}.", "NAS folder already mapped", MessageBoxButton.OK, MessageBoxImage.Information); return; }
-        var repaired = current with { ServerRootId = root.RootId, ServerRootName = root.Name, ServerDestinationItemId = dialog.DestinationItemId, ServerDestinationRelativePath = dialog.DestinationRelativePath, LastServerRevision = null, InventoryState = "NotStarted", LastError = null, Status = MappingStatus.ReadyForPreflight, UpdatedAt = DateTimeOffset.UtcNow };
-        await _mappingStore.UpdateMappingAsync(repaired);
-        DiagnosticsLogger.Write("REMOTE_ROOT_REPAIRED", $"folder_id={repaired.MappingId} local_path={repaired.LocalPath} remote_root_id={root.RootId} remote_path={root.RelativePath} state=ReadyForPreflight");
-        await RefreshMappingsAsync();
-        await _mappingRuntime.StartAsync(repaired);
-        AddActivity($"NAS destination selected for {repaired.LocalPath}: {root.Name}");
+        await ChooseDestinationAsync(mapping);
     }
 
     private void OpenMapping(string path)
@@ -423,15 +415,42 @@ public partial class MainWindow : Window
     {
         var current = await _mappingStore.GetMappingAsync(card.MappingId);
         if (current is null) return;
-        // Preflight mode: the user approving the plan leaves ReadyForPreflight
-        // and starts transfers; it does not put the mapping on hold.
-        if (current.Status == MappingStatus.ReadyForPreflight)
+        // StartSync handles the transition from preflight → syncing.
+        // Pause/Resume only applies when already syncing or paused.
+        if (current.Status == MappingStatus.ReadyForPreflight || current.Status == MappingStatus.ReadyToSync)
         {
-            await _mappingRuntime.SetPausedAsync(current, paused: false);
-            AddActivity($"Sync approved for {current.LocalPath}: leaving preflight, transfers will start.");
+            await StartSyncAsync(current);
             return;
         }
         await _mappingRuntime.SetPausedAsync(current, current.Status != MappingStatus.Paused);
+    }
+
+    private async Task StartSyncAsync(SyncMapping mapping)
+    {
+        await _mappingRuntime.StartSyncAsync(mapping);
+        AddActivity($"Sync started for {mapping.LocalPath}: transfers beginning.");
+        await RefreshMappingsAsync();
+    }
+
+    private async Task ChooseDestinationAsync(SyncMapping mapping)
+    {
+        var dialog = new AddFolderWindow(_foldersVm.Roots, RefreshRootsAsync, (rootId, parent, name) => _ = CreateNasFolderViaAsync(rootId, parent, name), LoadInventoryAsync, mapping.LocalPath, destinationOnly: true) { Owner = this, Title = "Choose NAS destination" };
+        if (dialog.ShowDialog() != true || dialog.SelectedRoot is not SyncRootDto root) return;
+        var current = await _mappingStore.GetMappingAsync(mapping.MappingId);
+        if (current is null) return;
+        var updated = current with { ServerRootId = root.RootId, ServerRootName = root.Name, ServerDestinationItemId = dialog.DestinationItemId, ServerDestinationRelativePath = dialog.DestinationRelativePath, LastServerRevision = null, InventoryState = "NotStarted", LastError = null, Status = MappingStatus.ReadyForPreflight, UpdatedAt = DateTimeOffset.UtcNow };
+        await _mappingStore.UpdateMappingAsync(updated);
+        await RefreshMappingsAsync();
+        await _mappingRuntime.StartAsync(updated);
+        AddActivity($"NAS destination changed to {root.Name}/{dialog.DestinationRelativePath}");
+    }
+
+    private async Task ReviewPlanAsync(SyncMapping mapping)
+    {
+        if (_transfer is null || mapping.ServerRootId is null) return;
+        var result = await _transfer.RebuildAsync(mapping);
+        AddActivity($"Sync plan reviewed: {result.NormalizedPendingCount} operations pending.");
+        await RefreshMappingsAsync();
     }
 
     private async void RemoveMapping(SyncMapping mapping)

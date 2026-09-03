@@ -14,4 +14,7 @@ public partial class FoldersView : WpfUserControl
     private void Repair_Click(object sender, RoutedEventArgs e) => Mapping(sender)?.Repair?.Invoke();
     private void CreateRoot_Click(object sender, RoutedEventArgs e) => Mapping(sender)?.CreateRoot?.Invoke();
     private void RefreshRoots_Click(object sender, RoutedEventArgs e) => Mapping(sender)?.RefreshRoots?.Invoke();
+    private void ChooseDestination_Click(object sender, RoutedEventArgs e) => Mapping(sender)?.ChooseDestination?.Invoke();
+    private void StartSync_Click(object sender, RoutedEventArgs e) => Mapping(sender)?.StartSync?.Invoke();
+    private void ReviewPlan_Click(object sender, RoutedEventArgs e) => Mapping(sender)?.ReviewPlan?.Invoke();
 }

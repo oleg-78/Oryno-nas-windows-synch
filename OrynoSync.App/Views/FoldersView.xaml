@@ -6,10 +6,20 @@
         <Border Background="{StaticResource PanelBrush}" BorderBrush="#303940" BorderThickness="1" CornerRadius="8" Padding="18" Margin="0,0,0,12"><StackPanel>
           <TextBlock Text="{Binding LocalPath}" FontSize="16" TextWrapping="Wrap"/>
           <TextBlock Text="{Binding RootName}" Foreground="{StaticResource MutedBrush}" Margin="0,5,0,0" TextWrapping="Wrap"/>
-          <TextBlock Text="{Binding Status}" Margin="0,14,0,0"/>
+          <TextBlock Text="{Binding Status}" Margin="0,14,0,0" FontWeight="SemiBold"/>
           <ProgressBar Height="5" Margin="0,8,0,2" IsIndeterminate="True"><ProgressBar.Style><Style TargetType="ProgressBar"><Setter Property="Visibility" Value="Collapsed"/><Style.Triggers><DataTrigger Binding="{Binding IsScanning}" Value="True"><Setter Property="Visibility" Value="Visible"/></DataTrigger></Style.Triggers></Style></ProgressBar.Style></ProgressBar>
           <TextBlock Text="{Binding IndexedText}" Foreground="{StaticResource MutedBrush}" Margin="0,4,0,0"/><TextBlock Text="{Binding PendingText}" Foreground="{StaticResource MutedBrush}" Margin="0,2,0,0" TextWrapping="Wrap"/><TextBlock Text="{Binding ErrorsText}" Foreground="{StaticResource MutedBrush}" Margin="0,2,0,0"/><TextBlock Text="{Binding LastSyncText}" Foreground="{StaticResource MutedBrush}" Margin="0,2,0,0"/>
-          <WrapPanel Margin="0,14,0,0"><Button Content="Open" Click="Open_Click"/><Button Content="Pause / Resume" Click="Pause_Click"/><Button Content="Rebuild sync state" Click="Rebuild_Click"/><Button Content="Choose destination" Click="Repair_Click"/><Button Content="Create NAS folder" Click="CreateRoot_Click"/><Button Content="Refresh roots" Click="RefreshRoots_Click"/><Button Content="Remove" Click="Remove_Click" Margin="0"/></WrapPanel>
+          <WrapPanel Margin="0,14,0,0">
+            <Button Content="Open" Click="Open_Click"/>
+            <Button Content="Start sync" Click="StartSync_Click" Visibility="{Binding CanStartSync, Converter={StaticResource BoolToVis}}"/>
+            <Button Content="Pause" Click="Pause_Click" Visibility="{Binding IsSyncing, Converter={StaticResource BoolToVis}}"/>
+            <Button Content="Resume" Click="Pause_Click" Visibility="{Binding IsPaused, Converter={StaticResource BoolToVis}}"/>
+            <Button Content="Review plan" Click="ReviewPlan_Click" Visibility="{Binding IsPreflight, Converter={StaticResource BoolToVis}}"/>
+            <Button Content="Choose destination" Click="ChooseDestination_Click"/>
+            <Button Content="Create NAS folder" Click="CreateRoot_Click"/>
+            <Button Content="Refresh roots" Click="RefreshRoots_Click"/>
+            <Button Content="Remove" Click="Remove_Click"/>
+          </WrapPanel>
         </StackPanel></Border>
       </DataTemplate></ItemsControl.ItemTemplate></ItemsControl>
     </StackPanel>

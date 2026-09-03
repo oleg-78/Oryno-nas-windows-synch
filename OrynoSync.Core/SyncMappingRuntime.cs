@@ -41,6 +41,18 @@ public sealed class SyncMappingRuntimeManager(ISyncMappingStore store)
         runtime.Start();
     }
 
+    public async Task StartSyncAsync(SyncMapping mapping, CancellationToken ct = default)
+    {
+        if (mapping.ServerRootId is null)
+        {
+            await SetStatusAsync(mapping, MappingStatus.ServerRootUnavailable, "NAS destination missing", ct);
+            return;
+        }
+        // Transition: ReadyForPreflight/ReadyToSync → Syncing (transfers begin)
+        await SetStatusAsync(mapping, MappingStatus.Syncing, null, ct);
+        if (_runtimes.TryGetValue(mapping.MappingId, out var runtime)) runtime.StartScan();
+    }
+
     public async Task SetPausedAsync(SyncMapping mapping, bool paused, CancellationToken ct = default)
     {
         if (mapping.ServerRootId is null)
