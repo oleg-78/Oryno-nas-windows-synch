@@ -42,6 +42,7 @@ public partial class MainWindow : Window
     private readonly SettingsView _settingsView;
     private string _lastConnectionVisual = "";
     private string _lastSyncVisual = "";
+    private ConnectionState? _lastConnectionState;
 
     private string DatabasePath => Path.Combine(_appData, "oryno-sync.db");
 
@@ -55,7 +56,7 @@ public partial class MainWindow : Window
         _remoteStore = new RemoteStateStore(DatabasePath);
         _mappingStore = new SqliteSyncMappingStore(DatabasePath);
         _mappingRuntime = new SyncMappingRuntimeManager(_mappingStore);
-        _mappingRuntime.Activity += (mapping, text) => AddActivity($"{Path.GetFileName(mapping.LocalPath)} - {text}");
+        _mappingRuntime.Activity += (mapping, text) => { AddActivity($"{Path.GetFileName(mapping.LocalPath)} - {text}"); if (mapping.ServerRootId is null) DiagnosticsLogger.Write("FOLDER_BLOCKED", $"folder_id={mapping.MappingId} local_path={mapping.LocalPath} remote_root_id=none remote_path=none state=ServerRootUnavailable reason=NAS destination missing"); };
         _mappingRuntime.Progress += (mapping, progress) => Dispatcher.BeginInvoke(() => ApplyMappingProgress(mapping, progress));
         _credentials = new WindowsCredentialStore(Path.Combine(_appData, "Credentials"));
         _activityVm.PauseOrResume = TogglePause;
@@ -67,6 +68,7 @@ public partial class MainWindow : Window
         _settingsVm.Disconnect = DisconnectAsync;
         _settingsVm.Reauthorize = ReauthorizeAsync;
         _settingsVm.DatabasePath = DatabasePath;
+        _settingsVm.InitializeStartup();
         _settingsVm.Device = Environment.MachineName + " - Windows";
         Loaded += LoadedAsync;
         NavigateTo(AppPage.Activity);
@@ -106,12 +108,6 @@ public partial class MainWindow : Window
             }
             mappings = await _mappingStore.GetMappingsAsync();
         }
-        if (_selectedRootId is Guid legacyRoot && mappings.Count(x => x.ServerRootId is null) == 1)
-        {
-            var legacy = mappings.First(x => x.ServerRootId is null);
-            await _mappingStore.UpdateMappingAsync(legacy with { ServerRootId = legacyRoot, UpdatedAt = DateTimeOffset.UtcNow });
-            mappings = await _mappingStore.GetMappingsAsync();
-        }
         await RefreshMappingsAsync(mappings);
         await _mappingRuntime.RestoreAsync();
         InitializeProductionClient();
@@ -137,7 +133,7 @@ public partial class MainWindow : Window
     {
         var handler = new BearerTokenHandler(ct => reader(CredentialAccount(uri), ct))
         {
-            InnerHandler = new SocketsHttpHandler { ConnectTimeout = TimeSpan.FromSeconds(8), PooledConnectionLifetime = TimeSpan.FromMinutes(10) }
+            InnerHandler = new HttpDiagnosticsHandler(uri) { InnerHandler = new SocketsHttpHandler { ConnectTimeout = TimeSpan.FromSeconds(8), PooledConnectionLifetime = TimeSpan.FromMinutes(10) } }
         };
         return new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(20) };
     }
@@ -174,11 +170,13 @@ public partial class MainWindow : Window
                 {
                     var pending = await _mappingStore.PendingCountAsync(mapping.MappingId, ct);
                     var current = await _mappingStore.GetMappingAsync(mapping.MappingId, ct);
-                    if (current is not null && current.Status != MappingStatus.Paused)
+                    if (current is not null && current.Status != MappingStatus.Paused && current.Status != MappingStatus.ReadyForPreflight)
                         await _mappingStore.UpdateMappingAsync(current with { Status = pending == 0 ? MappingStatus.UpToDate : MappingStatus.Syncing, LastError = null, UpdatedAt = DateTimeOffset.UtcNow }, ct);
                 }
                 var summary = await RefreshCountersAsync();
-                if (mappings.Count == 0) SetSyncStatus(EngineState.OnlineIdle, "Add a local folder to start syncing.");
+                var preflight = mappings.Any(x => x.Status == MappingStatus.ReadyForPreflight);
+                if (preflight) SetSyncStatus(EngineState.OnlineIdle, "Ready for preflight");
+                else if (mappings.Count == 0) SetSyncStatus(EngineState.OnlineIdle, "Add a local folder to start syncing.");
                 else if (summary.ErrorCount > 0) SetSyncStatus(EngineState.Error, "Sync issues need attention");
                 else if (summary.WaitingCount > 0) SetSyncStatus(EngineState.Syncing, "Changes waiting safely");
                 else SetSyncStatus(EngineState.UpToDate, "Up to date");
@@ -187,12 +185,21 @@ public partial class MainWindow : Window
             catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
             catch (SyncApiException ex) when (ex.Status == System.Net.HttpStatusCode.Unauthorized)
             {
+                DiagnosticsLogger.Write("CONNECTION_FAILURE", $"old_state={_lastConnectionState?.ToString() ?? "None"} new_state=AuthenticationExpired reason=HTTP unauthorized exception_type={ex.GetType().Name} http_status={(int)ex.Status} endpoint={DiagnosticsLogger.SafeEndpoint(TryGetServerUri())} retry={_failures} retry_delay_ms={BackoffMs()} network={DiagnosticsLogger.NetworkState()} auth={(_settingsVm.HasCredential ? "present" : "missing")}");
                 SetConnectionState(ConnectionState.AuthenticationExpired, "Authorization expired. Local changes are safe.");
                 await Delay(BackoffMs(), ct);
+            }
+            catch (SyncApiException ex)
+            {
+                DiagnosticsLogger.Write("SYNC_FAILURE", $"reason={SafeError(ex)} exception_type={ex.GetType().Name} http_status={(int)ex.Status} endpoint={DiagnosticsLogger.SafeEndpoint(TryGetServerUri())} retry={_failures} network={DiagnosticsLogger.NetworkState()} auth={(_settingsVm.HasCredential ? "present" : "missing")}");
+                SetSyncStatus(EngineState.Error, $"Sync issue: {ex.Code ?? "server rejected an operation"}");
+                AddActivity($"Sync error - {SafeError(ex)}");
+                await Delay(4000, ct);
             }
             catch (Exception ex)
             {
                 _failures++;
+                DiagnosticsLogger.Write("CONNECTION_FAILURE", $"old_state={_lastConnectionState?.ToString() ?? "None"} new_state={(_failures >= 3 ? ConnectionState.ServerUnavailable : ConnectionState.Reconnecting)} reason={SafeError(ex)} exception_type={ex.GetType().Name} http_status={(ex as SyncApiException is { } api ? (int)api.Status : 0)} endpoint={DiagnosticsLogger.SafeEndpoint(TryGetServerUri())} retry={_failures} retry_delay_ms={BackoffMs()} network={DiagnosticsLogger.NetworkState()} auth={(_settingsVm.HasCredential ? "present" : "missing")}");
                 SetConnectionState(_failures >= 3 ? ConnectionState.ServerUnavailable : ConnectionState.Reconnecting,
                     _failures >= 3 ? "Oryno NAS is unavailable. Local changes are safe." : "Reconnecting to Oryno NAS...");
                 AddActivity($"Connection error - {SafeError(ex)}");
@@ -264,6 +271,9 @@ public partial class MainWindow : Window
 
     private void SetConnectionState(ConnectionState state, string message)
     {
+        if (_lastConnectionState != state)
+            DiagnosticsLogger.Write("CONNECTION_STATE", $"old_state={_lastConnectionState?.ToString() ?? "None"} new_state={state} reason={message} exception_type=none http_status=none endpoint={DiagnosticsLogger.SafeEndpoint(_api is null ? null : new Uri(_settingsVm.ServerUrl))} retry={_failures} retry_delay_ms={BackoffMs()} network={DiagnosticsLogger.NetworkState()} auth={( _settingsVm.HasCredential ? "present" : "missing")} sync_folder_id={_selectedRootId?.ToString() ?? "none"}");
+        _lastConnectionState = state;
         var label = state switch
         {
             ConnectionState.Connected => "Connected",
@@ -298,7 +308,7 @@ public partial class MainWindow : Window
     {
         var label = state switch
         {
-            EngineState.OnlineIdle or EngineState.UpToDate => message.Contains("sync", StringComparison.OrdinalIgnoreCase) ? "Syncing files..." : "Up to date",
+            EngineState.OnlineIdle or EngineState.UpToDate => message == "Ready for preflight" ? "Ready for preflight" : "Up to date",
             EngineState.InitialInventory or EngineState.Reconciling => "Updating metadata...",
             EngineState.SyncingMetadata or EngineState.Syncing => "Syncing metadata...",
             EngineState.Paused => "Sync paused",
@@ -338,8 +348,70 @@ public partial class MainWindow : Window
                 card.Pause = () => ToggleMappingPause(card);
                 card.Rebuild = () => RebuildMapping(card.Mapping);
                 card.Remove = () => RemoveMapping(card.Mapping);
+                card.Repair = () => RepairMapping(card.Mapping);
+                card.CreateRoot = () => CreateNasFolderForMapping(card.Mapping);
+                card.RefreshRoots = () => _ = RefreshRootsAsync();
             }
         });
+    }
+
+    private async Task<IReadOnlyList<SyncRootDto>> RefreshRootsAsync()
+    {
+        if (_metadata is null) return [];
+        var roots = await _metadata.GetRootsAsync();
+        await Dispatcher.InvokeAsync(() => PopulateRoots(roots));
+        AddActivity($"NAS roots refreshed: {roots.Count:N0} available");
+        return roots;
+    }
+
+    private async Task CreateNasFolderViaAsync(Guid rootId, Guid? parentItemId, string name)
+    {
+        if (_api is null) throw new InvalidOperationException("Sync API is not initialised.");
+        var folder = await _api.CreateFolderAsync(rootId, parentItemId, name, Guid.NewGuid());
+        await RefreshRootsAsync();
+        AddActivity($"NAS folder \"{folder.Name}\" created");
+    }
+
+    private async Task<IReadOnlyList<RemoteItemDto>> LoadInventoryAsync(Guid rootId)
+    {
+        if (_api is null) throw new InvalidOperationException("Sync API is not initialised.");
+        var all = new List<RemoteItemDto>();
+        var cursor = (string?)null;
+        do
+        {
+            var page = await _api.GetInventoryPageAsync(rootId, cursor, 1000);
+            all.AddRange(page.Items);
+            cursor = page.NextCursor;
+        }
+        while (cursor != null);
+        return all;
+    }
+
+    private async void CreateNasFolderForMapping(SyncMapping mapping)
+    {
+        if (mapping.ServerRootId is null) { System.Windows.MessageBox.Show(this, "Select a NAS destination first.", "NAS destination required", MessageBoxButton.OK, MessageBoxImage.Information); return; }
+        var dlg = new CreateNasFolderDialog { Owner = this };
+        if (dlg.ShowDialog() != true) return;
+        var name = (dlg.FolderName ?? "").Trim(); if (name.Length == 0) return;
+        try { await CreateNasFolderViaAsync(mapping.ServerRootId.Value, null, name); }
+        catch (Exception ex) { System.Windows.MessageBox.Show(this, $"Unable to create the NAS folder.\n\n{ex.Message}", "Create NAS folder", MessageBoxButton.OK, MessageBoxImage.Error); }
+    }
+
+    private async void RepairMapping(SyncMapping mapping)
+    {
+        if (mapping.ServerRootId is not null) { await RefreshRootsAsync(); return; }
+        var dialog = new AddFolderWindow(_foldersVm.Roots, RefreshRootsAsync, (rootId, parent, name) => _ = CreateNasFolderViaAsync(rootId, parent, name), LoadInventoryAsync, mapping.LocalPath, destinationOnly: true) { Owner = this, Title = "Choose NAS destination" };
+        if (dialog.ShowDialog() != true || dialog.SelectedRoot is not SyncRootDto root) return;
+        var current = await _mappingStore.GetMappingAsync(mapping.MappingId);
+        if (current is null) return;
+        var other = (await _mappingStore.GetMappingsAsync()).FirstOrDefault(x => x.MappingId != mapping.MappingId && x.ServerRootId == root.RootId);
+        if (other is not null) { System.Windows.MessageBox.Show(this, $"This NAS folder is already linked to {other.LocalPath}.", "NAS folder already mapped", MessageBoxButton.OK, MessageBoxImage.Information); return; }
+        var repaired = current with { ServerRootId = root.RootId, ServerRootName = root.Name, ServerDestinationItemId = dialog.DestinationItemId, ServerDestinationRelativePath = dialog.DestinationRelativePath, LastServerRevision = null, InventoryState = "NotStarted", LastError = null, Status = MappingStatus.ReadyForPreflight, UpdatedAt = DateTimeOffset.UtcNow };
+        await _mappingStore.UpdateMappingAsync(repaired);
+        DiagnosticsLogger.Write("REMOTE_ROOT_REPAIRED", $"folder_id={repaired.MappingId} local_path={repaired.LocalPath} remote_root_id={root.RootId} remote_path={root.RelativePath} state=ReadyForPreflight");
+        await RefreshMappingsAsync();
+        await _mappingRuntime.StartAsync(repaired);
+        AddActivity($"NAS destination selected for {repaired.LocalPath}: {root.Name}");
     }
 
     private void OpenMapping(string path)
@@ -350,7 +422,16 @@ public partial class MainWindow : Window
     private async void ToggleMappingPause(MappingCardViewModel card)
     {
         var current = await _mappingStore.GetMappingAsync(card.MappingId);
-        if (current is not null) await _mappingRuntime.SetPausedAsync(current, current.Status != MappingStatus.Paused);
+        if (current is null) return;
+        // Preflight mode: the user approving the plan leaves ReadyForPreflight
+        // and starts transfers; it does not put the mapping on hold.
+        if (current.Status == MappingStatus.ReadyForPreflight)
+        {
+            await _mappingRuntime.SetPausedAsync(current, paused: false);
+            AddActivity($"Sync approved for {current.LocalPath}: leaving preflight, transfers will start.");
+            return;
+        }
+        await _mappingRuntime.SetPausedAsync(current, current.Status != MappingStatus.Paused);
     }
 
     private async void RemoveMapping(SyncMapping mapping)
@@ -379,7 +460,7 @@ public partial class MainWindow : Window
 
     private async void AddFolder()
     {
-        var dialog = new AddFolderWindow(_foldersVm.Roots) { Owner = this };
+        var dialog = new AddFolderWindow(_foldersVm.Roots, RefreshRootsAsync, (rootId, parent, name) => _ = CreateNasFolderViaAsync(rootId, parent, name), LoadInventoryAsync) { Owner = this };
         if (dialog.ShowDialog() != true) return;
         var path = SyncMappingRules.CanonicalLocalPath(dialog.LocalPath);
         var existing = await _mappingStore.GetMappingsAsync();
@@ -396,7 +477,8 @@ public partial class MainWindow : Window
         }
         var now = DateTimeOffset.UtcNow;
         var mapping = new SyncMapping(Guid.NewGuid(), dialog.LocalPath, dialog.SelectedRoot?.RootId, dialog.SelectedRoot?.Name, true,
-            now, now, null, "NotStarted", null, null, dialog.SelectedRoot is null ? MappingStatus.ServerRootUnavailable : MappingStatus.Scanning);
+            now, now, null, "NotStarted", null, null, dialog.SelectedRoot is null ? MappingStatus.ServerRootUnavailable : MappingStatus.Scanning,
+            dialog.DestinationItemId, dialog.DestinationRelativePath);
         try { await _mappingStore.AddMappingAsync(mapping); }
         catch (MappingAlreadyLinkedException)
         {
@@ -441,8 +523,10 @@ public partial class MainWindow : Window
     }
 
     private HttpClient CreateTokenHttpClient(Uri uri, string token) =>
-        new(new BearerTokenHandler(_ => Task.FromResult<string?>(token)) { InnerHandler = new SocketsHttpHandler { ConnectTimeout = TimeSpan.FromSeconds(8) } })
+        new(new BearerTokenHandler(_ => Task.FromResult<string?>(token)) { InnerHandler = new HttpDiagnosticsHandler(uri) { InnerHandler = new SocketsHttpHandler { ConnectTimeout = TimeSpan.FromSeconds(8) } } })
         { Timeout = TimeSpan.FromSeconds(20) };
+
+    private Uri? TryGetServerUri() => Uri.TryCreate(_settingsVm.ServerUrl, UriKind.Absolute, out var uri) ? uri : null;
 
     private async Task TestConnectionAsync(string serverUrl)
     {

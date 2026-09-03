@@ -74,6 +74,34 @@ public static class PathRules
 }
 public sealed class IgnoreRules(IEnumerable<string>? patterns = null)
 {
-    private readonly string[] _patterns = (patterns ?? new[] { "Thumbs.db", "desktop.ini", "~$*" }).ToArray();
-    public bool IsIgnored(string relativePath) { var name = Path.GetFileName(relativePath); return _patterns.Any(p => p.EndsWith('*') ? name.StartsWith(p[..^1], StringComparison.OrdinalIgnoreCase) : name.Equals(p, StringComparison.OrdinalIgnoreCase)); }
+    // Known temporary/system/staging items. A trailing '*' matches a leading name stem; all
+    // other patterns are exact, case-insensitive component matches. Matching ANY path component
+    // (file OR directory) ignores the whole path, so a staging directory like `.tmp.driveupload`
+    // is never recursed into and its subtree never enters the sync plan.
+    private readonly string[] _patterns = (patterns ?? new[]
+    {
+        "Thumbs.db", "desktop.ini", "~$*", ".tmp.drive*",
+        "*.tmp", "*.temp", "*.part", "*.partial", "*.crdownload",
+        ".DS_Store", "*.swp", "*.swo"
+    }).ToArray();
+    private static bool Matches(string name, string pattern) =>
+        pattern.Length > 1 && pattern.EndsWith('*') && pattern.StartsWith('*')
+            ? name.Contains(pattern[1..^1], StringComparison.OrdinalIgnoreCase)
+            : pattern.EndsWith('*')
+                ? name.StartsWith(pattern[..^1], StringComparison.OrdinalIgnoreCase)
+                : pattern.StartsWith('*')
+                    ? name.EndsWith(pattern[1..], StringComparison.OrdinalIgnoreCase)
+                    : name.Equals(pattern, StringComparison.OrdinalIgnoreCase);
+    public bool IsIgnored(string relativePath)
+    {
+        var rel = PathRules.NormalizeRelative(relativePath);
+        if (rel.Length == 0) return false;
+        foreach (var part in rel.Split('\\'))
+        {
+            if (part.Length == 0) continue;
+            foreach (var p in _patterns)
+                if (Matches(part, p)) return true;
+        }
+        return false;
+    }
 }

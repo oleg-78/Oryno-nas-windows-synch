@@ -24,6 +24,11 @@ public sealed class SyncMappingRuntimeManager(ISyncMappingStore store)
             await SetStatusAsync(mapping, MappingStatus.LocalFolderUnavailable, "Local folder unavailable", ct);
             return;
         }
+        if (mapping.ServerRootId is null)
+        {
+            await SetStatusAsync(mapping, MappingStatus.ServerRootUnavailable, "NAS destination missing", ct);
+            return;
+        }
 
         var runtime = new Runtime(
             mapping,
@@ -31,12 +36,18 @@ public sealed class SyncMappingRuntimeManager(ISyncMappingStore store)
             text => Activity?.Invoke(mapping, text),
             progress => Progress?.Invoke(mapping, progress));
         _runtimes[mapping.MappingId] = runtime;
-        await SetStatusAsync(mapping, MappingStatus.Scanning, null, ct);
+        if (mapping.Status != MappingStatus.ReadyForPreflight)
+            await SetStatusAsync(mapping, MappingStatus.Scanning, null, ct);
         runtime.Start();
     }
 
     public async Task SetPausedAsync(SyncMapping mapping, bool paused, CancellationToken ct = default)
     {
+        if (mapping.ServerRootId is null)
+        {
+            await SetStatusAsync(mapping, MappingStatus.ServerRootUnavailable, "NAS destination missing", ct);
+            return;
+        }
         if (_runtimes.TryGetValue(mapping.MappingId, out var runtime)) runtime.Paused = paused;
         await SetStatusAsync(mapping, paused ? MappingStatus.Paused : MappingStatus.Scanning, null, ct);
         if (!paused && _runtimes.TryGetValue(mapping.MappingId, out runtime)) runtime.StartScan();
@@ -178,7 +189,7 @@ public sealed class SyncMappingRuntimeManager(ISyncMappingStore store)
                 }
 
                 await FlushBatchAsync();
-                foreach (var missing in oldItems.Values.Where(x => !seen.Contains(x.RelativePath)))
+                foreach (var missing in oldItems.Values.Where(x => !seen.Contains(x.RelativePath) && !ignores.IsIgnored(x.RelativePath)))
                 {
                     ct.ThrowIfCancellationRequested();
                     await _store.RemoveItemAsync(_mapping.MappingId, missing.RelativePath, ct);
@@ -186,9 +197,12 @@ public sealed class SyncMappingRuntimeManager(ISyncMappingStore store)
                     changes++;
                 }
 
+                var current = await _store.GetMappingAsync(_mapping.MappingId, ct) ?? _mapping;
                 var finalStatus = _mapping.ServerRootId is null
                     ? MappingStatus.ServerRootUnavailable
-                    : MappingStatus.Syncing;
+                    : current.Status == MappingStatus.ReadyForPreflight
+                        ? MappingStatus.ReadyForPreflight
+                        : MappingStatus.Syncing;
                 await UpdateStatusAsync(finalStatus, null, ct);
                 _progress(new ScanProgress(files, folders, changes, true));
             }

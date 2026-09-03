@@ -15,8 +15,11 @@ public partial class App : Application
     public static bool CleanupSampleMappings { get; private set; }
     public static readonly EventWaitHandle ActivateEvent = new(false, EventResetMode.AutoReset, "Local\\OrynoSync.Activate");
     private Mutex? _mutex;
+    internal static bool StartedFromAutostart { get; private set; }
     protected override void OnStartup(StartupEventArgs e)
     {
+        StartedFromAutostart = e.Args.Any(x => x.Equals("--autostart", StringComparison.OrdinalIgnoreCase));
+        DiagnosticsLogger.Write(StartedFromAutostart ? "AUTOSTART_LAUNCH" : "APP_LAUNCH", $"executable={Environment.ProcessPath ?? "unknown"} args={string.Join(" ", e.Args)}");
         _mutex = new Mutex(true, "Local\\OrynoSync.SingleInstance", out var first);
         if (!first) { try { using var signal = EventWaitHandle.OpenExisting("Local\\OrynoSync.Activate"); signal.Set(); } catch { } Shutdown(); return; }
         base.OnStartup(e); MainWindow = new MainWindow();
@@ -24,6 +27,7 @@ public partial class App : Application
         CleanupSampleMappings = e.Args.Any(x => x.Equals("--cleanup-sample-mappings", StringComparison.OrdinalIgnoreCase));
         if (int.TryParse(e.Args.FirstOrDefault(x => x.StartsWith("--width=", StringComparison.OrdinalIgnoreCase))?["--width=".Length..], out var width)) MainWindow.Width = width;
         MainWindow.Show();
+        if (StartedFromAutostart) MainWindow.Hide();
         var capture = e.Args.FirstOrDefault(x => x.StartsWith("--capture=", StringComparison.OrdinalIgnoreCase));
         if (capture is not null)
         {

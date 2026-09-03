@@ -5,6 +5,7 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
     private readonly SqliteTransferSessionStore _sessions = new(Path.Combine(tempRoot, "transfer-state.db"));
     private readonly ResumableTransferClient _transfers = new(api, tempRoot, 3, new SqliteTransferSessionStore(Path.Combine(tempRoot, "transfer-state.db")));
     private readonly SemaphoreSlim _hashGate = new(2);
+    private static readonly IgnoreRules _ignores = new();
     private readonly IContentHasher _hasher = new Blake3ContentHasher();
     public event Action<SyncActivityEvent>? Activity;
 
@@ -18,17 +19,20 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
     public async Task<QueueNormalizationResult> RebuildAsync(SyncMapping mapping, CancellationToken ct = default)
     {
         if (mapping.ServerRootId is not Guid rootId) throw new InvalidOperationException("Select an Oryno NAS folder before rebuilding sync state.");
-        var remote = (await remoteState.GetRemoteItemsAsync(rootId, ct)).Where(x => !x.IsDeleted).ToArray();
+        var remote = (await remoteState.GetRemoteItemsAsync(rootId, ct))
+            .Where(x => !x.IsDeleted && mapping.InDestination(x.RelativePath))
+            .Select(x => { var l = mapping.ToLocalRel(x.RelativePath); return l is null ? null : x with { RelativePath = l }; })
+            .Where(x => x is not null).Select(x => x!).ToArray();
         var oldPending = await mappings.GetPendingAsync(mapping.MappingId, DateTimeOffset.MaxValue, ct);
         var desired = await SnapshotAsync(mapping.LocalPath, ct);
         var plan = QueueNormalizer.Plan(desired, remote, oldPending);
         var normalized = plan.Conflicts.Select(path => new MappingPendingOperation(Guid.NewGuid(), mapping.MappingId, OperationType.Conflict, path, null, DateTimeOffset.UtcNow, 0, DateTimeOffset.MaxValue, OperationState.Failed, "SYNC_CONFLICT: local and NAS content differ.")).ToList();
         normalized.AddRange(plan.Operations.Select(operation => new MappingPendingOperation(Guid.NewGuid(), mapping.MappingId, operation.Type, operation.RelativePath, null, DateTimeOffset.UtcNow, 0, DateTimeOffset.UtcNow, OperationState.Pending, null)));
-        var remoteByPath = remote.ToDictionary(x => x.RelativePath, StringComparer.OrdinalIgnoreCase);
+        var remoteByPath = remote.ToDictionary(x => PathRules.NormalizeRelative(x.RelativePath), StringComparer.OrdinalIgnoreCase);
         var items = desired.Select(item => new MappingLocalItem(mapping.MappingId, item.RelativePath, item.ItemType, item.Size, item.Mtime, item.ItemType == ItemType.File && remoteByPath.TryGetValue(item.RelativePath, out var r) && string.Equals(item.ContentHash, r.ContentHash, StringComparison.OrdinalIgnoreCase) ? SyncItemState.Synced : SyncItemState.Waiting)).ToArray();
         await mappings.ReplaceItemsAsync(mapping.MappingId, items, ct);
         await mappings.ReplacePendingAsync(mapping.MappingId, normalized, ct);
-        await mappings.UpdateMappingAsync(mapping with { InventoryState = "Normalized", Status = normalized.Count == 0 ? MappingStatus.UpToDate : MappingStatus.Syncing, UpdatedAt = DateTimeOffset.UtcNow }, ct);
+        await mappings.UpdateMappingAsync(mapping with { InventoryState = "Normalized", Status = normalized.Count == 0 ? MappingStatus.UpToDate : MappingStatus.ReadyForPreflight, UpdatedAt = DateTimeOffset.UtcNow }, ct);
         return plan;
     }
 
@@ -44,13 +48,24 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
     private async Task ProcessMappingAsync(SyncMapping mapping, CancellationToken ct, int maxOperations)
     {
         var rootId = mapping.ServerRootId!.Value;
-        var remote = (await remoteState.GetRemoteItemsAsync(rootId, ct)).Where(x => !x.IsDeleted).ToDictionary(x => x.RelativePath, StringComparer.OrdinalIgnoreCase);
+        // Key remote lookup by CANONICAL path form so `a/b` (server forward slash)
+        // and `a\b` (local backslash) always match. Without this, ProcessOperation
+        // saw `existing == null` for an already-present NAS file and kept issuing
+        // CreateFile → server 409 SYNC_NAME_CONFLICT → the infinite .txt loop.
+        var remote = (await remoteState.GetRemoteItemsAsync(rootId, ct)).Where(x => !x.IsDeleted).ToDictionary(x => PathRules.NormalizeRelative(x.RelativePath), StringComparer.OrdinalIgnoreCase);
         var local = (await mappings.GetItemsAsync(mapping.MappingId, ct)).ToDictionary(x => x.RelativePath, StringComparer.OrdinalIgnoreCase);
         var pending = await mappings.GetPendingAsync(mapping.MappingId, DateTimeOffset.UtcNow, ct);
         if (!string.Equals(mapping.InventoryState, "Normalized", StringComparison.OrdinalIgnoreCase))
         {
             var desired = await SnapshotAsync(mapping.LocalPath, ct);
-            var plan = QueueNormalizer.Plan(desired, remote.Values, pending);
+            // Same destination-scoped remote view as RebuildAsync: only items inside the
+            // selected destination subtree, expressed as local-relative paths, so the plan
+            // never mixes root-level NAS content with the mapping's destination (Работа/…).
+            var remoteInDestination = (await remoteState.GetRemoteItemsAsync(rootId, ct))
+                .Where(x => !x.IsDeleted && mapping.InDestination(x.RelativePath))
+                .Select(x => { var rel = mapping.ToLocalRel(x.RelativePath); return rel is null ? null : x with { RelativePath = rel }; })
+                .Where(x => x is not null).Select(x => x!).ToArray();
+            var plan = QueueNormalizer.Plan(desired, remoteInDestination, pending);
             var normalized = new List<MappingPendingOperation>();
             normalized.AddRange(plan.Conflicts.Select(path => new MappingPendingOperation(Guid.NewGuid(), mapping.MappingId, OperationType.Conflict, path, null, DateTimeOffset.UtcNow, 0, DateTimeOffset.MaxValue, OperationState.Failed, "SYNC_CONFLICT: local and NAS content differ.")));
             normalized.AddRange(plan.Operations.Select(operation => new MappingPendingOperation(Guid.NewGuid(), mapping.MappingId, operation.Type, operation.RelativePath, null, DateTimeOffset.UtcNow, 0, DateTimeOffset.UtcNow, OperationState.Pending, null)));
@@ -58,12 +73,24 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
             await mappings.UpdateMappingAsync(mapping with { InventoryState = "Normalized", UpdatedAt = DateTimeOffset.UtcNow }, ct);
             pending = normalized.Where(x => x.State is OperationState.Pending or OperationState.Failed).ToArray();
         }
+        // Preflight mode (dest picked, queue rebuilt) must not start transfers:
+        // the desired-state plan exists, but no operation is executed until the
+        // user explicitly leaves ReadyForPreflight.
+        if (mapping.Status == MappingStatus.ReadyForPreflight) return;
         foreach (var operation in pending.Take(Math.Max(1, maxOperations)))
         {
             try { await ProcessOperationAsync(mapping, rootId, operation, remote, local, ct); }
             catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
             catch (Exception ex)
             {
+                // A download whose NAS content no longer exists is reconciled by dropping the
+                // remote record (handled by ApplyRemoteOnly) instead of retrying forever.
+                if (ex is SyncApiException api404 && (api404.Code == "SYNC_CONTENT_MISSING" || api404.Code == "SYNC_ITEM_NOT_FOUND"))
+                {
+                    await mappings.UpdateOperationAsync(operation with { State = OperationState.Completed, LastError = ex.Message, NextAttemptAt = DateTimeOffset.MaxValue }, ct);
+                    await RecordAsync(mapping, operation.RelativePath, operation.Type.ToString(), "Error", ex.Message, ct);
+                    continue;
+                }
                 var attempts = operation.AttemptCount + 1;
                 var permanent = ex is SyncApiException apiError && (apiError.Code is "SYNC_CONFLICT" or "SYNC_NAME_CONFLICT" or "SYNC_HASH_MISMATCH" or "SYNC_NAME_INVALID") || ex is FileChangedDuringTransferException;
                 await mappings.UpdateOperationAsync(operation with { State = permanent ? OperationState.Failed : OperationState.Failed, AttemptCount = attempts, LastError = ex.Message, NextAttemptAt = permanent ? DateTimeOffset.MaxValue : DateTimeOffset.UtcNow.AddSeconds(Math.Min(60, Math.Pow(2, attempts))) }, ct);
@@ -78,22 +105,40 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
         if (!Directory.Exists(root)) return [];
         var result = new List<DesiredLocalItem>(); var hasher = new Blake3ContentHasher();
         foreach (var path in Directory.EnumerateFileSystemEntries(root, "*", new EnumerationOptions { RecurseSubdirectories = true, IgnoreInaccessible = true, AttributesToSkip = FileAttributes.ReparsePoint }))
-        { ct.ThrowIfCancellationRequested(); var rel = PathRules.ToRelative(root, path); if (!PathRules.IsWindowsCompatible(rel)) continue; if (Directory.Exists(path)) result.Add(new(rel, ItemType.Directory, 0, Directory.GetLastWriteTimeUtc(path), null)); else { var info = new FileInfo(path); result.Add(new(rel, ItemType.File, info.Length, info.LastWriteTimeUtc, await hasher.ComputeAsync(path, ct))); } }
+        {
+            ct.ThrowIfCancellationRequested(); var rel = PathRules.ToRelative(root, path); if (!PathRules.IsWindowsCompatible(rel) || _ignores.IsIgnored(rel)) continue;
+            if (Directory.Exists(path)) { result.Add(new(rel, ItemType.Directory, 0, Directory.GetLastWriteTimeUtc(path), null)); continue; }
+            try
+            {
+                var info = new FileInfo(path);
+                result.Add(new(rel, ItemType.File, info.Length, info.LastWriteTimeUtc, await hasher.ComputeAsync(path, ct)));
+            }
+            catch (IOException) { /* file locked by Office/antivirus: skip, next pass will retry */ }
+            catch (UnauthorizedAccessException) { /* protected item: skip */ }
+        }
         return result;
     }
 
     private async Task ProcessOperationAsync(SyncMapping mapping, Guid rootId, MappingPendingOperation op, Dictionary<string, RemoteItemState> remote, IReadOnlyDictionary<string, MappingLocalItem> local, CancellationToken ct)
     {
         var rel = PathRules.NormalizeRelative(op.RelativePath);
+        // Temporary/system/staging files never become sync operations: mark them complete (skip)
+        // so they are not uploaded, downloaded, moved, or deleted remotely.
+        if (_ignores.IsIgnored(rel) || (op.Type == OperationType.Move && op.SecondaryPath is not null && _ignores.IsIgnored(op.SecondaryPath)))
+        {
+            await mappings.UpdateOperationAsync(op with { State = OperationState.Completed, LastError = null, NextAttemptAt = DateTimeOffset.MaxValue }, ct);
+            return;
+        }
         if (!PathRules.IsWindowsCompatible(rel)) throw new IOException("invalid filename: Windows cannot materialize this path.");
-        remote.TryGetValue(rel, out var existing);
+        var remoteRel = mapping.Scope(rel); // root-relative server path (destination-prefixed)
+        remote.TryGetValue(remoteRel, out var existing);
         switch (op.Type)
         {
             case OperationType.CreateDirectory:
                 if (existing is null)
                 {
-                    var folder = await api.CreateFolderAsync(rootId, FindParent(remote, rel), Path.GetFileName(rel), op.OperationId, ct);
-                    remote[rel] = new RemoteItemState(folder.ItemId, rootId, folder.ParentItemId, folder.Name, folder.RelativePath, folder.ItemType, folder.SizeBytes, folder.MtimeUtc, folder.ContentHash, folder.Version, 0, RemotePlanningState.MetadataOnly);
+                    var folder = await api.CreateFolderAsync(rootId, FindParent(remote, remoteRel), Path.GetFileName(remoteRel), op.OperationId, ct);
+                    remote[remoteRel] = new RemoteItemState(folder.ItemId, rootId, folder.ParentItemId, folder.Name, folder.RelativePath, folder.ItemType, folder.SizeBytes, folder.MtimeUtc, folder.ContentHash, folder.Version, 0, RemotePlanningState.MetadataOnly);
                 }
                 break;
             case OperationType.CreateFile:
@@ -104,17 +149,24 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
                 if (existing is not null && string.Equals(existing.ContentHash, hash, StringComparison.OrdinalIgnoreCase)) { }
                 else
                 {
-                    var result = await _transfers.UploadAsync(path, new UploadTarget(rootId, FindParent(remote, rel), Path.GetFileName(rel), existing?.ItemId, existing?.Version, op.OperationId, mapping.MappingId), ct);
+                    try { await _transfers.UploadAsync(path, new UploadTarget(rootId, FindParent(remote, remoteRel), Path.GetFileName(remoteRel), existing?.ItemId, existing?.Version, op.OperationId, mapping.MappingId), ct); }
+                    catch (SyncApiException e) when (e.Code == "SYNC_NAME_CONFLICT")
+                    {
+                        // The NAS already has a file at this canonical path but the cached
+                        // inventory didn't (stale cursor). Reconcile by binding to it instead
+                        // of failing the op and re-creating CreateFile forever (name-exists loop).
+                        if (await TryBindExistingAsync(mapping, rootId, remoteRel, ct) is null) throw;
+                    }
                     await mappings.UpsertItemAsync(new(mapping.MappingId, rel, ItemType.File, info.Length, info.LastWriteTimeUtc, SyncItemState.Synced), ct);
                     await RecordAsync(mapping, rel, "Uploaded", "Synced", null, ct);
-                    _ = result;
                 }
                 break;
             case OperationType.Move:
                 if (op.SecondaryPath is null) throw new IOException("Move destination is missing.");
-                if (!remote.TryGetValue(rel, out var moved)) throw new SyncApiException(System.Net.HttpStatusCode.NotFound, "SYNC_ITEM_NOT_FOUND", "The moved item no longer exists on Oryno NAS.");
+                if (!remote.TryGetValue(remoteRel, out var moved)) throw new SyncApiException(System.Net.HttpStatusCode.NotFound, "SYNC_ITEM_NOT_FOUND", "The moved item no longer exists on Oryno NAS.");
                 var destination = PathRules.NormalizeRelative(op.SecondaryPath);
-                await api.MoveItemAsync(moved.ItemId, FindParent(remote, destination), Path.GetFileName(destination), moved.Version, op.OperationId, ct);
+                var destRemote = mapping.Scope(destination);
+                await api.MoveItemAsync(moved.ItemId, FindParent(remote, destRemote), Path.GetFileName(destRemote), moved.Version, op.OperationId, ct);
                 await mappings.RemoveItemAsync(mapping.MappingId, rel, ct);
                 if (local.TryGetValue(rel, out var old)) await mappings.UpsertItemAsync(old with { RelativePath = destination }, ct);
                 await RecordAsync(mapping, destination, "Moved", "Synced", null, ct);
@@ -143,39 +195,68 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
     private async Task ApplyRemoteOnlyAsync(SyncMapping mapping, Guid rootId, IReadOnlyDictionary<string, RemoteItemState> remote, IReadOnlyDictionary<string, MappingLocalItem> local, CancellationToken ct)
     {
         var pendingPaths = (await mappings.GetPendingAsync(mapping.MappingId, DateTimeOffset.MaxValue, ct)).Select(x => PathRules.NormalizeRelative(x.RelativePath)).ToHashSet(StringComparer.OrdinalIgnoreCase);
-        foreach (var item in remote.Values.OrderBy(x => x.RelativePath.Count(c => c == '\\')))
+        foreach (var item in remote.Values.OrderBy(x => x.RelativePath.Count(c => c == '\\')).OrderBy(x => x.RelativePath.Count(c => c == '/')))
         {
-            if (!PathRules.IsWindowsCompatible(item.RelativePath)) { await RecordAsync(mapping, item.RelativePath, "Download", "Error", "invalid filename: Windows cannot materialize this path.", ct); continue; }
-            var full = PathRules.ToAbsolute(mapping.LocalPath, item.RelativePath);
+            if (!mapping.InDestination(item.RelativePath)) continue;          // outside the selected destination subtree
+            var localRel = mapping.ToLocalRel(item.RelativePath);
+            if (localRel is null) continue;                                    // the destination boundary itself — not a local item
+            if (_ignores.IsIgnored(localRel)) continue;                        // never materialize temporary/system/staging content locally
+            if (!PathRules.IsWindowsCompatible(localRel)) { await RecordAsync(mapping, item.RelativePath, "Download", "Error", "invalid filename: Windows cannot materialize this path.", ct); continue; }
+            var full = PathRules.ToAbsolute(mapping.LocalPath, localRel);
             if (item.ItemType.Equals("directory", StringComparison.OrdinalIgnoreCase)) { Directory.CreateDirectory(full); continue; }
             if (item.ContentHash is null) continue;
             if (File.Exists(full))
             {
                 var localHash = await HashAsync(full, ct);
                 if (string.Equals(localHash, item.ContentHash, StringComparison.OrdinalIgnoreCase)) continue;
-                if (pendingPaths.Contains(item.RelativePath))
+                if (pendingPaths.Contains(localRel))
                 {
                     var conflict = ConflictCopyPath(full);
-                    await _transfers.DownloadAsync(new DownloadTarget(item.ItemId, item.Version, item.RelativePath, item.SizeBytes ?? 0, item.ContentHash, item.MtimeUtc), conflict, ct);
-                    await RecordAsync(mapping, item.RelativePath, "Conflict", "Error", "This file was changed both locally and on Oryno NAS.", ct);
+                    try
+                    {
+                        await _transfers.DownloadAsync(new DownloadTarget(item.ItemId, item.Version, localRel, item.SizeBytes ?? 0, item.ContentHash, item.MtimeUtc), conflict, ct);
+                        await RecordAsync(mapping, localRel, "Conflict", "Error", "This file was changed both locally and on Oryno NAS.", ct);
+                    }
+                    catch (SyncApiException e) when (e.Code == "SYNC_CONTENT_MISSING")
+                    {
+                        await RecordAsync(mapping, localRel, "Download", "Error", e.Message, ct);
+                    }
                     continue;
                 }
             }
             Directory.CreateDirectory(Path.GetDirectoryName(full)!);
             RemoteItemDto current;
-            try { current = await api.GetItemAsync(item.ItemId, ct); } catch (SyncApiException e) when (e.Code == "SYNC_ITEM_NOT_FOUND") { continue; }
-            await _transfers.DownloadAsync(new DownloadTarget(current.ItemId, current.Version, current.RelativePath, current.SizeBytes ?? 0, current.ContentHash ?? item.ContentHash!, current.MtimeUtc), full, ct);
-            var info = new FileInfo(full); await mappings.UpsertItemAsync(new(mapping.MappingId, item.RelativePath, ItemType.File, info.Length, info.LastWriteTimeUtc, SyncItemState.Synced), ct);
-            await RecordAsync(mapping, item.RelativePath, "Downloaded", "Synced", null, ct);
+            try { current = await api.GetItemAsync(item.ItemId, ct); }
+            catch (SyncApiException e) when (e.Code == "SYNC_ITEM_NOT_FOUND") { await remoteState.MarkItemMissingAsync(rootId, item.ItemId.ToString(), ct); await RecordAsync(mapping, localRel, "Download", "Error", e.Message, ct); continue; }
+            try
+            {
+                await _transfers.DownloadAsync(new DownloadTarget(current.ItemId, current.Version, localRel, current.SizeBytes ?? 0, current.ContentHash ?? item.ContentHash!, current.MtimeUtc), full, ct);
+                var info = new FileInfo(full); await mappings.UpsertItemAsync(new(mapping.MappingId, localRel, ItemType.File, info.Length, info.LastWriteTimeUtc, SyncItemState.Synced), ct);
+                await RecordAsync(mapping, localRel, "Downloaded", "Synced", null, ct);
+            }
+            catch (SyncApiException e) when (e.Code == "SYNC_CONTENT_MISSING")
+            {
+                // Content is gone server-side. Drop it from the cached inventory so it is
+                // not re-attempted every pass (the endless SYNC_CONTENT_MISSING download loop).
+                await remoteState.MarkItemMissingAsync(rootId, item.ItemId.ToString(), ct);
+                await RecordAsync(mapping, localRel, "Download", "Error", e.Message, ct);
+            }
         }
-        foreach (var item in local.Values.Where(x => !remote.ContainsKey(x.RelativePath)).ToArray())
+        // Intentionally do NOT delete local-only files on a routine pass. The local folder is
+        // the source of truth for local changes: deletions propagate via the watcher → Delete op
+        // → server DeleteItem above. Auto-deleting local-only files here caused the destructive
+        // mirror (data loss) and the delete → re-download → re-create conflict loop.
+    }
+
+    private async Task<RemoteItemState?> TryBindExistingAsync(SyncMapping mapping, Guid rootId, string rel, CancellationToken ct)
+    {
+        foreach (var item in await remoteState.GetRemoteItemsAsync(rootId, ct))
         {
-            if (pendingPaths.Contains(item.RelativePath)) continue;
-            var full = PathRules.ToAbsolute(mapping.LocalPath, item.RelativePath);
-            if (item.ItemType == ItemType.Directory) Directory.Delete(full, true); else if (File.Exists(full)) File.Delete(full);
-            await mappings.RemoveItemAsync(mapping.MappingId, item.RelativePath, ct);
-            await RecordAsync(mapping, item.RelativePath, "Deleted", "Synced", null, ct);
+            if (item.IsDeleted) continue;
+            if (string.Equals(PathRules.NormalizeRelative(item.RelativePath), rel, StringComparison.OrdinalIgnoreCase))
+                return item;
         }
+        return null;
     }
 
     private static string ConflictCopyPath(string path)

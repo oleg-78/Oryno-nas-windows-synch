@@ -21,6 +21,7 @@ public sealed record SyncRootDto(
 {
     [JsonPropertyName("storage_node_id")] public int StorageNodeId { get; init; }
     [JsonPropertyName("relative_path")] public string RelativePath { get; init; } = "";
+    [JsonPropertyName("root_purpose")] public string RootPurpose { get; init; } = "";
 };
 public sealed record RemoteItemDto(
     [property:JsonPropertyName("item_id")] Guid ItemId,
