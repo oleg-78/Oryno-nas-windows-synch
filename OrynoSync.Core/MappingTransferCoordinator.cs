@@ -73,9 +73,12 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
             await mappings.UpdateMappingAsync(mapping with { InventoryState = "Normalized", UpdatedAt = DateTimeOffset.UtcNow }, ct);
             pending = normalized.Where(x => x.State is OperationState.Pending or OperationState.Failed).ToArray();
         }
+        // Re-read status from DB to get fresh state (RebuildAsync may have set ReadyToSync).
+        var freshMapping = await mappings.GetMappingAsync(mapping.MappingId, ct) ?? mapping;
         // Preflight modes (ReadyForPreflight, ReadyToSync): plan exists, but no
-        // transfers run until the user explicitly approves via StartSync.
-        if (mapping.Status == MappingStatus.ReadyForPreflight || mapping.Status == MappingStatus.ReadyToSync) return;
+        // transfers run until the user explicitly approves via Start.
+        // Stopped: sync engine disabled by user, no transfers.
+        if (freshMapping.Status is MappingStatus.ReadyForPreflight or MappingStatus.ReadyToSync or MappingStatus.Stopped) return;
         foreach (var operation in pending.Take(Math.Max(1, maxOperations)))
         {
             try { await ProcessOperationAsync(mapping, rootId, operation, remote, local, ct); }

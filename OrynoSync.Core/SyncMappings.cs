@@ -2,7 +2,7 @@ using Microsoft.Data.Sqlite;
 
 namespace OrynoSync.Core;
 
-public enum MappingStatus { UpToDate, Scanning, Syncing, Offline, Paused, AuthenticationRequired, LocalFolderUnavailable, ServerRootUnavailable, WaitingForContentSupport, Conflict, Error, ReadyForPreflight, ReadyToSync }
+public enum MappingStatus { UpToDate, Scanning, Syncing, Offline, Paused, AuthenticationRequired, LocalFolderUnavailable, ServerRootUnavailable, WaitingForContentSupport, Conflict, Error, ReadyForPreflight, ReadyToSync, Stopped }
 public sealed record SyncMapping(Guid MappingId, string LocalPath, Guid? ServerRootId, string? ServerRootName, bool Enabled, DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt, long? LastServerRevision, string InventoryState, DateTimeOffset? LastScanAt, string? LastError, MappingStatus Status = MappingStatus.Offline, Guid? ServerDestinationItemId = null, string? ServerDestinationRelativePath = null)
 {
     /// <summary>Root-relative server path of the nested destination (e.g. "Work" or "Work\Contracts");

@@ -36,7 +36,7 @@ public sealed class SyncMappingRuntimeManager(ISyncMappingStore store)
             text => Activity?.Invoke(mapping, text),
             progress => Progress?.Invoke(mapping, progress));
         _runtimes[mapping.MappingId] = runtime;
-        if (mapping.Status != MappingStatus.ReadyForPreflight)
+        if (mapping.Status is not MappingStatus.ReadyForPreflight and not MappingStatus.ReadyToSync and not MappingStatus.Stopped)
             await SetStatusAsync(mapping, MappingStatus.Scanning, null, ct);
         runtime.Start();
     }
@@ -212,9 +212,11 @@ public sealed class SyncMappingRuntimeManager(ISyncMappingStore store)
                 var current = await _store.GetMappingAsync(_mapping.MappingId, ct) ?? _mapping;
                 var finalStatus = _mapping.ServerRootId is null
                     ? MappingStatus.ServerRootUnavailable
-                    : current.Status == MappingStatus.ReadyForPreflight
-                        ? MappingStatus.ReadyForPreflight
-                        : MappingStatus.Syncing;
+                    : current.Status is MappingStatus.Syncing or MappingStatus.Scanning
+                        ? current.Status  // don't overwrite active sync states
+                        : current.Status is MappingStatus.ReadyForPreflight or MappingStatus.ReadyToSync
+                            ? MappingStatus.ReadyForPreflight  // internal pre-sync states: keep as-is
+                            : MappingStatus.Syncing;
                 await UpdateStatusAsync(finalStatus, null, ct);
                 _progress(new ScanProgress(files, folders, changes, true));
             }

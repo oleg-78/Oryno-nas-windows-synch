@@ -5,7 +5,8 @@ namespace OrynoSync.App.Views;
 public partial class ActivityView : WpfUserControl
 {
     public ActivityView() => InitializeComponent();
-    private void Pause_Click(object sender, RoutedEventArgs e) => (DataContext as ActivityViewModel)?.PauseOrResume?.Invoke();
+    private void StartSync_Click(object sender, RoutedEventArgs e) => (DataContext as ActivityViewModel)?.StartSync?.Invoke();
+    private void StopSync_Click(object sender, RoutedEventArgs e) => (DataContext as ActivityViewModel)?.StopSync?.Invoke();
     private void OpenFolder_Click(object sender, RoutedEventArgs e) => (DataContext as ActivityViewModel)?.OpenFolder?.Invoke();
     private void ToggleErrors_Click(object sender, RoutedEventArgs e)
     {
