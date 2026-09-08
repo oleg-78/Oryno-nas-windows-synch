@@ -28,7 +28,9 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
         var plan = QueueNormalizer.Plan(desired, remote, oldPending);
         var normalized = plan.Conflicts.Select(path => new MappingPendingOperation(Guid.NewGuid(), mapping.MappingId, OperationType.Conflict, path, null, DateTimeOffset.UtcNow, 0, DateTimeOffset.MaxValue, OperationState.Failed, "SYNC_CONFLICT: local and NAS content differ.")).ToList();
         normalized.AddRange(plan.Operations.Select(operation => new MappingPendingOperation(Guid.NewGuid(), mapping.MappingId, operation.Type, operation.RelativePath, null, DateTimeOffset.UtcNow, 0, DateTimeOffset.UtcNow, OperationState.Pending, null)));
-        var remoteByPath = remote.ToDictionary(x => PathRules.NormalizeRelative(x.RelativePath), StringComparer.OrdinalIgnoreCase);
+        var remoteByPath = remote
+            .GroupBy(x => PathRules.NormalizeRelative(x.RelativePath), StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(g => g.Key, g => g.First(), StringComparer.OrdinalIgnoreCase);
         var items = desired.Select(item => new MappingLocalItem(mapping.MappingId, item.RelativePath, item.ItemType, item.Size, item.Mtime, item.ItemType == ItemType.File && remoteByPath.TryGetValue(item.RelativePath, out var r) && string.Equals(item.ContentHash, r.ContentHash, StringComparison.OrdinalIgnoreCase) ? SyncItemState.Synced : SyncItemState.Waiting)).ToArray();
         await mappings.ReplaceItemsAsync(mapping.MappingId, items, ct);
         await mappings.ReplacePendingAsync(mapping.MappingId, normalized, ct);
@@ -52,8 +54,11 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
         // and `a\b` (local backslash) always match. Without this, ProcessOperation
         // saw `existing == null` for an already-present NAS file and kept issuing
         // CreateFile → server 409 SYNC_NAME_CONFLICT → the infinite .txt loop.
-        var remote = (await remoteState.GetRemoteItemsAsync(rootId, ct)).Where(x => !x.IsDeleted).ToDictionary(x => PathRules.NormalizeRelative(x.RelativePath), StringComparer.OrdinalIgnoreCase);
-        var local = (await mappings.GetItemsAsync(mapping.MappingId, ct)).ToDictionary(x => x.RelativePath, StringComparer.OrdinalIgnoreCase);
+        var remote = (await remoteState.GetRemoteItemsAsync(rootId, ct))
+            .Where(x => !x.IsDeleted)
+            .GroupBy(x => PathRules.NormalizeRelative(x.RelativePath), StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(g => g.Key, g => g.First(), StringComparer.OrdinalIgnoreCase);
+        var local = (await mappings.GetItemsAsync(mapping.MappingId, ct)).GroupBy(x => x.RelativePath, StringComparer.OrdinalIgnoreCase).ToDictionary(g => g.Key, g => g.First(), StringComparer.OrdinalIgnoreCase);
         var pending = await mappings.GetPendingAsync(mapping.MappingId, DateTimeOffset.UtcNow, ct);
         if (!string.Equals(mapping.InventoryState, "Normalized", StringComparison.OrdinalIgnoreCase))
         {

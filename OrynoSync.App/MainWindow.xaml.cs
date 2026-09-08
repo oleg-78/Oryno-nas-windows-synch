@@ -203,12 +203,50 @@ public partial class MainWindow : Window
             }
             catch (Exception ex)
             {
-                _failures++;
-                DiagnosticsLogger.Write("CONNECTION_FAILURE", $"old_state={_lastConnectionState?.ToString() ?? "None"} new_state={(_failures >= 3 ? ConnectionState.ServerUnavailable : ConnectionState.Reconnecting)} reason={SafeError(ex)} exception_type={ex.GetType().Name} http_status={(ex as SyncApiException is { } api ? (int)api.Status : 0)} endpoint={DiagnosticsLogger.SafeEndpoint(TryGetServerUri())} retry={_failures} retry_delay_ms={BackoffMs()} network={DiagnosticsLogger.NetworkState()} auth={(_settingsVm.HasCredential ? "present" : "missing")}");
-                SetConnectionState(_failures >= 3 ? ConnectionState.ServerUnavailable : ConnectionState.Reconnecting,
-                    _failures >= 3 ? "Oryno NAS is unavailable. Local changes are safe." : "Reconnecting to Oryno NAS...");
-                AddActivity($"Connection error - {SafeError(ex)}");
-                await Delay(BackoffMs(), ct);
+                var errorInfo = ErrorClassifier.Classify(ex);
+
+                // NETWORK FAILURE → Reconnecting (existing behavior)
+                if (errorInfo.Category == ErrorClassifier.Category.Network ||
+                    errorInfo.Category == ErrorClassifier.Category.ServerTransport)
+                {
+                    _failures++;
+                    DiagnosticsLogger.Write(errorInfo.LogType, $"old_state={_lastConnectionState?.ToString() ?? "None"} new_state={(_failures >= 3 ? ConnectionState.ServerUnavailable : ConnectionState.Reconnecting)} reason={errorInfo.UserMessage} exception_type={ex.GetType().Name} http_status={(ex as SyncApiException is { } api ? (int)api.Status : 0)} endpoint={DiagnosticsLogger.SafeEndpoint(TryGetServerUri())} retry={_failures} retry_delay_ms={BackoffMs()} network={DiagnosticsLogger.NetworkState()} auth={(_settingsVm.HasCredential ? "present" : "missing")} stack={ex.StackTrace}");
+                    SetConnectionState(_failures >= 3 ? ConnectionState.ServerUnavailable : ConnectionState.Reconnecting,
+                        _failures >= 3 ? "Oryno NAS is unavailable. Local changes are safe." : "Reconnecting to Oryno NAS...");
+                    AddActivity($"Connection error - {errorInfo.UserMessage}");
+                    await Delay(BackoffMs(), ct);
+                    continue;
+                }
+
+                // REVISION REGRESSION → Connection stays Connected, re-inventory
+                if (errorInfo.Category == ErrorClassifier.Category.RevisionRegression)
+                {
+                    DiagnosticsLogger.Write(errorInfo.LogType, $"reason={errorInfo.UserMessage} exception_type={ex.GetType().Name}");
+                    AddActivity(errorInfo.UserMessage);
+                    // Reset inventory and continue (connection stays Connected)
+                    await Delay(1000, ct);
+                    continue;
+                }
+
+                // SERVER SEMANTIC (4xx/5xx) → Connection stays Connected, Sync issues
+                if (errorInfo.Category == ErrorClassifier.Category.ServerSemantic)
+                {
+                    DiagnosticsLogger.Write(errorInfo.LogType, $"reason={errorInfo.UserMessage} exception_type={ex.GetType().Name} http_status={(ex as SyncApiException is { } api ? (int)api.Status : 0)} endpoint={DiagnosticsLogger.SafeEndpoint(TryGetServerUri())}");
+                    AddActivity($"Sync error - {errorInfo.UserMessage}");
+                    SetSyncStatus(EngineState.Error, $"Sync issue: {errorInfo.UserMessage}");
+                    // Connection remains Connected — do not increment _failures
+                    await Delay(4000, ct);
+                    continue;
+                }
+
+                // APPLICATION ERROR → Connection stays Connected, Sync issues
+                // This is the critical fix: ArgumentException, InvalidOperationException, etc.
+                // must NOT trigger Reconnecting state.
+                DiagnosticsLogger.Write(errorInfo.LogType, $"reason={errorInfo.UserMessage} exception_type={ex.GetType().Name} message={ex.Message} stack={ex.StackTrace}");
+                AddActivity($"Sync error - {errorInfo.UserMessage}");
+                SetSyncStatus(EngineState.Error, $"Sync issues need attention");
+                // Connection remains Connected — do not increment _failures
+                await Delay(4000, ct);
             }
         }
     }
@@ -332,10 +370,29 @@ public partial class MainWindow : Window
         if (progress.IsComplete) _ = RefreshCountersAsync();
     }
 
+    private string? _lastActivityText;
+    private int _lastActivityRepeatCount;
+    private DateTimeOffset _lastActivityFirstSeen;
     private void AddActivity(string text)
     {
         var now = DateTimeOffset.Now;
         _ = _mappingStore.RecordActivityAsync(new SyncActivityEvent(Guid.NewGuid(), null, null, "Activity", "Indexed", now, null, text));
+
+        // Deduplication: if same message repeats, show "Occurrences: N" instead of spamming UI
+        if (_lastActivityText == text && (now - _lastActivityFirstSeen).TotalMinutes < 5)
+        {
+            _lastActivityRepeatCount++;
+            // Update the last activity entry with repeat count instead of adding new one
+            Dispatcher.BeginInvoke(() => {
+                if (_activityVm.Items.Count > 0 && _activityVm.Items[0].Contains("Occurrences:"))
+                    _activityVm.Items.RemoveAt(0);
+                _activityVm.Items.Insert(0, $"{now:t}  {text}  (Occurrences: {_lastActivityRepeatCount})");
+            });
+            return;
+        }
+        _lastActivityText = text;
+        _lastActivityRepeatCount = 1;
+        _lastActivityFirstSeen = now;
         Dispatcher.BeginInvoke(() => _activityVm.Add($"{now:t}  {text}"));
     }
     private static string SafeError(Exception ex) => ex is SyncApiException api ? $"{api.Code} ({(int)api.Status})" : ex.GetType().Name;
