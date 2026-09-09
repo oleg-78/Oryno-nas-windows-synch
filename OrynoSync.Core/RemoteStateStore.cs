@@ -25,6 +25,7 @@ public interface IRemoteStateStore
     Task MarkItemMissingAsync(Guid rootId, string serverItemId, CancellationToken ct = default);
     Task<DateTimeOffset?> GetLastSuccessfulFileSyncForMappingAsync(Guid mappingId, CancellationToken ct = default);
     Task RecordSuccessfulFileSyncForMappingAsync(Guid mappingId, CancellationToken ct = default);
+    Task RefreshFromServerAsync(Guid rootId, Func<Guid, CancellationToken, Task<IReadOnlyList<RemoteItemDto>>> fetcher, CancellationToken ct = default);
 }
 
 public sealed class RemoteStateStore(string databasePath) : IRemoteStateStore
@@ -315,5 +316,23 @@ public sealed class RemoteStateStore(string databasePath) : IRemoteStateStore
         Add(cmd.Parameters, "$t", DateTimeOffset.UtcNow.ToString("O"));
         Add(cmd.Parameters, "$m", mappingId.ToString());
         await cmd.ExecuteNonQueryAsync(ct);
+    }
+
+    /// <summary>
+    /// Section 2 fix: Real server refresh — fetch authoritative items from server API
+    /// and persist into RemoteStateStore. This is NOT the same as GetRemoteItemsAsync
+    /// which reads the local SQLite cache.
+    /// </summary>
+    public async Task RefreshFromServerAsync(Guid rootId, Func<Guid, CancellationToken, Task<IReadOnlyList<RemoteItemDto>>> fetcher, CancellationToken ct = default)
+    {
+        var freshItems = await fetcher(rootId, ct);
+
+        await using var c = Open();
+        await using var tx = c.BeginTransaction();
+        foreach (var i in freshItems)
+        {
+            await UpsertAsync(c, tx, rootId, i, 0, 0, ct);
+        }
+        await tx.CommitAsync(ct);
     }
 }

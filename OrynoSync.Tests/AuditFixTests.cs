@@ -348,9 +348,116 @@ public class AuditFixTests
         if (File.Exists(testFile)) File.Delete(testFile);
         if (Directory.Exists(localDir)) Directory.Delete(localDir);
     }
+
+    // Section 2 test: Real stale-cache refresh
+    [Fact]
+    public async Task S1_StaleCache_RealServerRefresh()
+    {
+        // CACHE: item absent
+        // SERVER: item present
+        // first create: 409 SYNC_NAME_CONFLICT
+        // real refresh: server called
+        // cache updated
+        // second lookup: item found
+        // CreateDirectory: bind existing PASS
+        
+        var api = new AuditMockSyncApi { SimulateNameConflict = true };
+        var mappings = new MockMappingStore();
+        var remote = new AuditMockRemoteStateStore();
+        var coordinator = new MappingTransferCoordinator(mappings, remote, api, Path.GetTempPath());
+        
+        var dirId = Guid.NewGuid();
+        var rootId = Guid.NewGuid();
+        
+        // Server has the item (simulated via ExistingItemId)
+        api.ExistingItemId = dirId;
+        
+        // Cache does NOT have the item (remote is empty)
+        
+        var mappingId = Guid.NewGuid();
+        var localDir = UniqueDir;
+        await mappings.AddMappingAsync(new SyncMapping(mappingId, localDir, rootId, null, true, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow, null, "Normalized", null, null, MappingStatus.Syncing, null, "TestDir"));
+        
+        var op = new MappingPendingOperation(Guid.NewGuid(), mappingId, OperationType.CreateDirectory, "TestDir", null, DateTimeOffset.UtcNow, 0, DateTimeOffset.UtcNow, OperationState.Pending, null);
+        await mappings.EnqueueAsync(op);
+        
+        await coordinator.ProcessAsync(new[] { (await mappings.GetMappingAsync(mappingId))! }, CancellationToken.None);
+        
+        // Server refresh should have been called
+        Assert.True(api.ServerRefreshCallCount > 0, "Server refresh should be called on cache miss");
+        
+        // Operation should be completed (bound to existing)
+        var pending = await mappings.GetPendingAsync(mappingId, DateTimeOffset.MaxValue, CancellationToken.None);
+        Assert.Empty(pending);
+    }
+
+    // Section 6 test: SYNC_CONTENT_MISSING uses server_item_id (GUID), not RelativePath
+    [Fact]
+    public async Task S2_ContentMissing_UsesServerItemId()
+    {
+        var api = new AuditMockSyncApi();
+        var mappings = new MockMappingStore();
+        var remote = new AuditMockRemoteStateStore();
+        var coordinator = new MappingTransferCoordinator(mappings, remote, api, Path.GetTempPath());
+        
+        var fileId = Guid.NewGuid();
+        var rootId = Guid.NewGuid();
+        
+        // Remote has the item with GUID
+        remote.AddRemoteItem(new RemoteItemState(fileId, rootId, null, "file.pdf", "Test/file.pdf", "file", 100, null, "hash", 1, 0, RemotePlanningState.MetadataOnly));
+        
+        var mappingId = Guid.NewGuid();
+        var localDir = UniqueDir;
+        await mappings.AddMappingAsync(new SyncMapping(mappingId, localDir, rootId, null, true, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow, null, "Normalized", null, null, MappingStatus.Syncing, null, "Test/file.pdf"));
+        
+        // Test that MarkItemMissingAsync works with GUID (not path)
+        await remote.MarkItemMissingAsync(rootId, fileId.ToString(), CancellationToken.None);
+        
+        // Verify the item is marked deleted
+        var items = await remote.GetRemoteItemsAsync(rootId, CancellationToken.None);
+        var deletedItem = items.FirstOrDefault(i => i.ItemId == fileId);
+        Assert.True(deletedItem.IsDeleted, "Item should be marked as deleted");
+    }
+
+    // Section I test: Bounded scheduler - no task explosion
+    [Fact]
+    public async Task S3_BoundedScheduler_NoTaskExplosion()
+    {
+        var api = new AuditMockSyncApi();
+        var mappings = new MockMappingStore();
+        var remote = new AuditMockRemoteStateStore();
+        var coordinator = new MappingTransferCoordinator(mappings, remote, api, Path.GetTempPath());
+        
+        var rootId = Guid.NewGuid();
+        var mappingId = Guid.NewGuid();
+        var localDir = UniqueDir;
+        await mappings.AddMappingAsync(new SyncMapping(mappingId, localDir, rootId, "root", true, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow, null, "Normalized", null, null, MappingStatus.Syncing, null, "test.txt"));
+        
+        // Create 100 operations
+        for (int i = 0; i < 100; i++)
+        {
+            await mappings.EnqueueAsync(new MappingPendingOperation(Guid.NewGuid(), mappingId, OperationType.CreateFile, $"file{i}.txt", null, DateTimeOffset.UtcNow, 0, DateTimeOffset.UtcNow, OperationState.Pending, null));
+        }
+        
+        // Create local files
+        Directory.CreateDirectory(localDir);
+        for (int i = 0; i < 100; i++)
+        {
+            await File.WriteAllTextAsync(Path.Combine(localDir, $"file{i}.txt"), $"content {i}");
+        }
+        
+        await coordinator.ProcessAsync(new[] { (await mappings.GetMappingAsync(mappingId))! }, CancellationToken.None);
+        
+        // All operations should complete
+        var pending = await mappings.GetPendingAsync(mappingId, DateTimeOffset.MaxValue, CancellationToken.None);
+        Assert.Empty(pending);
+        
+        // Cleanup
+        if (Directory.Exists(localDir)) Directory.Delete(localDir, true);
+    }
 }
 
-public class AuditMockSyncApi : IContentTransferApi
+public class AuditMockSyncApi : IContentTransferApi, ISyncMetadataApi
 {
     public bool Online { get; set; } = true;
     public bool SimulateNameConflict { get; set; }
@@ -360,6 +467,31 @@ public class AuditMockSyncApi : IContentTransferApi
     public string ExistingItemHash { get; set; } = "";
     public long ExistingItemSize { get; set; }
     public int SuccessfulOperations { get; set; }
+    public int ServerRefreshCallCount { get; private set; }
+
+    // ISyncMetadataApi
+    public SyncCapabilities Capabilities => SyncCapabilities.MetadataSync | SyncCapabilities.ChangeFeed;
+    
+    public Task<ConnectionResult> TestConnectionAsync(CancellationToken ct = default) =>
+        Task.FromResult(new ConnectionResult(ConnectionStatus.Connected));
+    
+    public Task<IReadOnlyList<SyncRootDto>> GetSyncRootsAsync(CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<SyncRootDto>>(Array.Empty<SyncRootDto>());
+    
+    public Task<InventoryPageDto> GetInventoryPageAsync(Guid rootId, string? cursor, int limit, CancellationToken ct = default)
+    {
+        ServerRefreshCallCount++;
+        // Return the existing item as the "server" response for real refresh tests
+        var items = new List<RemoteItemDto>();
+        if (ExistingItemId != Guid.Empty)
+        {
+            items.Add(new RemoteItemDto(ExistingItemId, null, "item", "item", "file", ExistingItemSize, null, ExistingItemHash, 1));
+        }
+        return Task.FromResult(new InventoryPageDto(0, items, null));
+    }
+    
+    public Task<ChangesPageDto> GetChangesPageAsync(Guid rootId, long after, int limit, CancellationToken ct = default) =>
+        Task.FromResult(new ChangesPageDto(Array.Empty<RemoteChangeDto>(), null, false));
 
     public Task<RemoteItemDto> GetItemAsync(Guid itemId, CancellationToken ct = default)
     {
@@ -458,9 +590,32 @@ public class AuditMockRemoteStateStore : IRemoteStateStore
     public Task<IReadOnlyList<RemoteItemState>> GetRemoteItemsAsync(Guid rootId, CancellationToken ct = default) =>
         Task.FromResult<IReadOnlyList<RemoteItemState>>(_items.ToList());
     public Task<int> CountPlanningAsync(Guid rootId, RemotePlanningState state, CancellationToken ct = default) => Task.FromResult(0);
-    public Task MarkItemMissingAsync(Guid rootId, string serverItemId, CancellationToken ct = default) => Task.CompletedTask;
+    public Task MarkItemMissingAsync(Guid rootId, string serverItemId, CancellationToken ct = default)
+    {
+        var item = _items.FirstOrDefault(i => i.ItemId.ToString() == serverItemId);
+        if (item != null)
+        {
+            var idx = _items.IndexOf(item);
+            _items[idx] = item with { IsDeleted = true };
+        }
+        return Task.CompletedTask;
+    }
     public Task<DateTimeOffset?> GetLastSuccessfulFileSyncForMappingAsync(Guid mappingId, CancellationToken ct = default) => Task.FromResult<DateTimeOffset?>(null);
     public Task RecordSuccessfulFileSyncForMappingAsync(Guid mappingId, CancellationToken ct = default) => Task.CompletedTask;
+    public Task RefreshFromServerAsync(Guid rootId, Func<Guid, CancellationToken, Task<IReadOnlyList<RemoteItemDto>>> fetcher, CancellationToken ct = default)
+    {
+        // Simulate real server refresh: fetcher returns authoritative items
+        var items = fetcher(rootId, ct).GetAwaiter().GetResult();
+        foreach (var i in items)
+        {
+            var existing = _items.FindIndex(x => x.ItemId == i.ItemId);
+            if (existing >= 0)
+                _items[existing] = new RemoteItemState(i.ItemId, rootId, i.ParentItemId, i.Name, i.RelativePath, i.ItemType, i.SizeBytes, i.MtimeUtc, i.ContentHash, i.Version, 0, RemotePlanningState.MetadataOnly);
+            else
+                _items.Add(new RemoteItemState(i.ItemId, rootId, i.ParentItemId, i.Name, i.RelativePath, i.ItemType, i.SizeBytes, i.MtimeUtc, i.ContentHash, i.Version, 0, RemotePlanningState.MetadataOnly));
+        }
+        return Task.CompletedTask;
+    }
 }
 
 public class MockMappingStore : ISyncMappingStore

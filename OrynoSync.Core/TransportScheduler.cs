@@ -13,6 +13,9 @@ internal sealed class TransportScheduler : IDisposable
 {
     private readonly SemaphoreSlim _globalGate;
     private int _activeCount;
+    private long _totalCompleted;
+    private long _totalQueued;
+    private int _maxActive;
 
     public TransportScheduler(int maxConcurrentTransfers = 3)
     {
@@ -20,19 +23,44 @@ internal sealed class TransportScheduler : IDisposable
     }
 
     public int ActiveCount => Volatile.Read(ref _activeCount);
+    public long TotalCompleted => Volatile.Read(ref _totalCompleted);
+    public long TotalQueued => Volatile.Read(ref _totalQueued);
+    public int MaxActive => Volatile.Read(ref _maxActive);
+
+    /// <summary>
+    /// Snapshot of current scheduler metrics for diagnostics.
+    /// </summary>
+    public SchedulerMetrics GetMetrics()
+    {
+        return new SchedulerMetrics(
+            TotalQueued,
+            ActiveCount,
+            TotalCompleted,
+            MaxActive);
+    }
 
     /// <summary>
     /// Acquires a transport slot. Returns a releaser that must be disposed when transfer completes.
     /// </summary>
     public async Task<IDisposable> AcquireAsync(CancellationToken ct = default)
     {
+        Interlocked.Increment(ref _totalQueued);
         await _globalGate.WaitAsync(ct);
-        Interlocked.Increment(ref _activeCount);
+        var active = Interlocked.Increment(ref _activeCount);
+        // Track max active (for diagnostics)
+        int currentMax;
+        do
+        {
+            currentMax = Volatile.Read(ref _maxActive);
+            if (active <= currentMax) break;
+        } while (Interlocked.CompareExchange(ref _maxActive, active, currentMax) != currentMax);
+        
         return new SlotReleaser(this);
     }
 
     private void Release()
     {
+        Interlocked.Increment(ref _totalCompleted);
         Interlocked.Decrement(ref _activeCount);
         _globalGate.Release();
     }
@@ -44,6 +72,11 @@ internal sealed class TransportScheduler : IDisposable
 
     public void Dispose() => _globalGate.Dispose();
 }
+
+/// <summary>
+/// Snapshot of scheduler metrics for diagnostics and live reporting.
+/// </summary>
+public sealed record SchedulerMetrics(long Queued, int Running, long Completed, int MaxActive);
 
 /// <summary>
 /// Groups operations into waves based on dependency ordering.

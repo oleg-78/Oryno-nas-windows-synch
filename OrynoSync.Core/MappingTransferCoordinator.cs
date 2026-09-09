@@ -239,9 +239,17 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
             }
             else
             {
-                // Multiple independent operations — run concurrently
-                var tasks = wave.Select(op => ProcessOperationSafeAsync(mapping, rootId, op, remote, local, ct)).ToList();
-                await Task.WhenAll(tasks);
+                // Section I fix: Bounded execution — max 3 concurrent operations per wave
+                // Uses Parallel.ForEachAsync to avoid allocating thousands of Task objects
+                var options = new ParallelOptions
+                {
+                    MaxDegreeOfParallelism = 3,
+                    CancellationToken = ct
+                };
+                await Parallel.ForEachAsync(wave, options, async (op, ct) =>
+                {
+                    await ProcessOperationSafeAsync(mapping, rootId, op, remote, local, ct);
+                });
             }
         }
         
@@ -272,7 +280,14 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
             else if (ex is SyncApiException apiContentMissing && apiContentMissing.Code == "SYNC_CONTENT_MISSING")
             {
                 // Section 6 fix: Stale remote download metadata — mark remote missing, reconcile
-                await remoteState.MarkItemMissingAsync(rootId, op.RelativePath, ct);
+                // FIX: Must pass serverItemId (GUID), NOT RelativePath
+                var serverItemId = ResolveServerItemIdForOperation(op, remote);
+                if (serverItemId is not null)
+                {
+                    await remoteState.MarkItemMissingAsync(rootId, serverItemId, ct);
+                    // Also mark in remote dictionary to prevent reprocessing in same cycle
+                    MarkRemoteItemDeleted(remote, op.RelativePath);
+                }
                 await mappings.UpdateOperationAsync(op with { State = OperationState.FailedPermanent, AttemptCount = attempts, LastError = ex.Message, NextAttemptAt = DateTimeOffset.MaxValue }, ct);
                 await RecordAsync(mapping, op.RelativePath, op.Type.ToString(), "Error", $"Content missing, marked for reconcile: {ex.Message}", ct);
             }
@@ -684,7 +699,9 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
 
     /// <summary>
     /// Section 2 fix: Find actual server item by path with REAL server refresh.
-    /// First tries cache, then falls back to server-side lookup.
+    /// First tries cache, then falls back to actual server API call.
+    /// Uses ISyncMetadataApi.GetInventoryPageAsync to fetch authoritative data,
+    /// persists to RemoteStateStore, then re-looks up.
     /// </summary>
     private async Task<RemoteItemState?> FindActualServerItemAsync(Guid rootId, string remoteRel, Dictionary<string, RemoteItemState> currentRemote, CancellationToken ct)
     {
@@ -696,29 +713,34 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
                 return item;
         }
         
-        // Section 2 fix: Real server refresh — fetch from server API
-        // Try to find the item by checking parent directory's children
-        var parentPath = Path.GetDirectoryName(remoteRel)?.Replace('/', '\\');
-        var fileName = Path.GetFileName(remoteRel);
-        
-        if (parentPath != null && currentRemote.TryGetValue(parentPath, out var parentItem))
+        // Section 2 fix: Real server refresh — fetch from server API (NOT SQLite cache)
+        if (api is ISyncMetadataApi metadataApi)
         {
-            // Try to get the specific item by path from server
             try
             {
-                // Use GetItemAsync with the parent to find children
-                // Since we don't have a direct "lookup by path" API, we refresh the root inventory
-                // and look for the specific path
-                var allItems = await remoteState.GetRemoteItemsAsync(rootId, ct);
-                var match = allItems.FirstOrDefault(i => 
-                    !i.IsDeleted && 
-                    string.Equals(PathRules.NormalizeRelative(i.RelativePath), remoteRel, StringComparison.OrdinalIgnoreCase));
+                // Fetch authoritative inventory from server
+                var page = await metadataApi.GetInventoryPageAsync(rootId, null, 5000, ct);
                 
-                if (match != null)
+                // Persist fresh data into RemoteStateStore (real server → SQLite)
+                await remoteState.RefreshFromServerAsync(rootId, (r, c) =>
                 {
-                    // Update the current remote dictionary with the fresh item
-                    currentRemote[remoteRel] = match;
-                    return match;
+                    // Return the fetched items as the "fetcher" result
+                    return Task.FromResult<IReadOnlyList<RemoteItemDto>>(page.Items);
+                }, ct);
+                
+                // Now look up in the freshly updated remote dictionary
+                foreach (var item in page.Items)
+                {
+                    if (string.Equals(PathRules.NormalizeRelative(item.RelativePath), remoteRel, StringComparison.OrdinalIgnoreCase))
+                    {
+                        var state = new RemoteItemState(item.ItemId, rootId, item.ParentItemId, item.Name,
+                            item.RelativePath, item.ItemType, item.SizeBytes, item.MtimeUtc, item.ContentHash,
+                            item.Version, 0, item.ItemType == "directory" ? RemotePlanningState.MetadataOnly : RemotePlanningState.NeedsDownload);
+                        
+                        // Update the current remote dictionary with the fresh item
+                        currentRemote[remoteRel] = state;
+                        return state;
+                    }
                 }
             }
             catch
@@ -752,6 +774,26 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
         if (mapping.ServerRootId is Guid rootId)
         {
             await remoteState.RecordSuccessfulFileSyncAsync(rootId, ct);
+        }
+    }
+
+    private static string? ResolveServerItemIdForOperation(MappingPendingOperation op, Dictionary<string, RemoteItemState> remote)
+    {
+        // Try to find the item in remote dictionary by path
+        var rel = PathRules.NormalizeRelative(op.RelativePath);
+        if (remote.TryGetValue(rel, out var existing) && existing.ItemId != Guid.Empty)
+        {
+            return existing.ItemId.ToString();
+        }
+        return null;
+    }
+
+    private static void MarkRemoteItemDeleted(Dictionary<string, RemoteItemState> remote, string relativePath)
+    {
+        var rel = PathRules.NormalizeRelative(relativePath);
+        if (remote.TryGetValue(rel, out var existing))
+        {
+            remote[rel] = existing with { IsDeleted = true };
         }
     }
 
