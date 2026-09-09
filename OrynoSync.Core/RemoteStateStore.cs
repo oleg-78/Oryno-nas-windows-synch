@@ -23,6 +23,8 @@ public interface IRemoteStateStore
     Task<IReadOnlyList<RemoteItemState>> GetRemoteItemsAsync(Guid rootId, CancellationToken ct = default);
     Task<int> CountPlanningAsync(Guid rootId, RemotePlanningState state, CancellationToken ct = default);
     Task MarkItemMissingAsync(Guid rootId, string serverItemId, CancellationToken ct = default);
+    Task<DateTimeOffset?> GetLastSuccessfulFileSyncForMappingAsync(Guid mappingId, CancellationToken ct = default);
+    Task RecordSuccessfulFileSyncForMappingAsync(Guid mappingId, CancellationToken ct = default);
 }
 
 public sealed class RemoteStateStore(string databasePath) : IRemoteStateStore
@@ -288,5 +290,30 @@ public sealed class RemoteStateStore(string databasePath) : IRemoteStateStore
         var result = await cmd.ExecuteScalarAsync(ct);
         if (result is string s && DateTimeOffset.TryParse(s, out var dt)) return dt;
         return null;
+    }
+
+    /// <summary>
+    /// Section 9 fix: Retrieve last successful file sync timestamp for a specific mapping.
+    /// </summary>
+    public async Task<DateTimeOffset?> GetLastSuccessfulFileSyncForMappingAsync(Guid mappingId, CancellationToken ct = default)
+    {
+        await using var c = Open();
+        await using var cmd = c.CreateCommand("SELECT last_successful_file_sync FROM sync_mappings WHERE mapping_id=$m");
+        Add(cmd.Parameters, "$m", mappingId.ToString());
+        var result = await cmd.ExecuteScalarAsync(ct);
+        if (result is string s && DateTimeOffset.TryParse(s, out var dt)) return dt;
+        return null;
+    }
+
+    /// <summary>
+    /// Section 9 fix: Record successful file sync timestamp for a specific mapping.
+    /// </summary>
+    public async Task RecordSuccessfulFileSyncForMappingAsync(Guid mappingId, CancellationToken ct = default)
+    {
+        await using var c = Open();
+        await using var cmd = c.CreateCommand("UPDATE sync_mappings SET last_successful_file_sync=$t WHERE mapping_id=$m");
+        Add(cmd.Parameters, "$t", DateTimeOffset.UtcNow.ToString("O"));
+        Add(cmd.Parameters, "$m", mappingId.ToString());
+        await cmd.ExecuteNonQueryAsync(ct);
     }
 }

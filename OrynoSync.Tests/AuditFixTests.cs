@@ -386,6 +386,8 @@ public class AuditMockRemoteStateStore : IRemoteStateStore
         Task.FromResult<IReadOnlyList<RemoteItemState>>(_items.ToList());
     public Task<int> CountPlanningAsync(Guid rootId, RemotePlanningState state, CancellationToken ct = default) => Task.FromResult(0);
     public Task MarkItemMissingAsync(Guid rootId, string serverItemId, CancellationToken ct = default) => Task.CompletedTask;
+    public Task<DateTimeOffset?> GetLastSuccessfulFileSyncForMappingAsync(Guid mappingId, CancellationToken ct = default) => Task.FromResult<DateTimeOffset?>(null);
+    public Task RecordSuccessfulFileSyncForMappingAsync(Guid mappingId, CancellationToken ct = default) => Task.CompletedTask;
 }
 
 public class MockMappingStore : ISyncMappingStore
