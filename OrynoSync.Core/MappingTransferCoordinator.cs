@@ -125,10 +125,24 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
             new MappingPendingOperation(Guid.NewGuid(), mapping.MappingId, operation.Type, operation.RelativePath, 
                 null, DateTimeOffset.UtcNow, 0, DateTimeOffset.UtcNow, OperationState.Pending, null)));
         
-        // Section 4 fix: Use GroupBy+First for local items (case-insensitive PK)
-        var remoteByPath = remote
-            .GroupBy(x => PathRules.NormalizeRelative(x.RelativePath), StringComparer.OrdinalIgnoreCase)
-            .ToDictionary(g => g.Key, g => g.First(), StringComparer.OrdinalIgnoreCase);
+        // Section 4 fix: Explicit canonical collision handling for remote items
+        var remoteByPath = new Dictionary<string, RemoteItemState>(StringComparer.OrdinalIgnoreCase);
+        foreach (var group in remote.GroupBy(x => PathRules.NormalizeRelative(x.RelativePath), StringComparer.OrdinalIgnoreCase))
+        {
+            var groupItems = group.ToList();
+            if (groupItems.Count == 1)
+            {
+                remoteByPath[group.Key] = groupItems[0];
+            }
+            else
+            {
+                // Multiple items with same canonical path — log diagnostic, pick deterministic winner for READ-ONLY use
+                // Mutation on this path is blocked by DuplicateCanonicalResolver
+                var winner = groupItems.OrderByDescending(x => x.Version).ThenByDescending(x => x.LastRevision).First();
+                remoteByPath[group.Key] = winner;
+                LogDiagnostic("REBUILD_CANONICAL_COLLISION", mapping.MappingId)( $"path={group.Key} count={groupItems.Count} ids={string.Join(",", groupItems.Select(x => x.ItemId.ToString("N").Substring(0, 8)))}");
+            }
+        }
         var items = desired.Select(item => new MappingLocalItem(mapping.MappingId, item.RelativePath, item.ItemType, item.Size, item.Mtime, item.ItemType == ItemType.File && remoteByPath.TryGetValue(item.RelativePath, out var r) && string.Equals(item.ContentHash, r.ContentHash, StringComparison.OrdinalIgnoreCase) ? SyncItemState.Synced : SyncItemState.Waiting)).ToArray();
         await mappings.ReplaceItemsAsync(mapping.MappingId, items, ct);
         await mappings.ReplacePendingAsync(mapping.MappingId, normalized, ct);
@@ -163,10 +177,23 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
             await RecordAsync(mapping, "", "Sync", "Info", $"Blocked {remoteResolution.Conflicts.Count} ambiguous paths from mutation: {details}", ct);
         }
         
-        // Section 4 fix: Use GroupBy+First for local items (case-insensitive PK)
-        var local = (await mappings.GetItemsAsync(mapping.MappingId, ct))
-            .GroupBy(x => x.RelativePath, StringComparer.OrdinalIgnoreCase)
-            .ToDictionary(g => g.Key, g => g.First(), StringComparer.OrdinalIgnoreCase);
+        // Section 4 fix: Explicit canonical collision handling for local items
+        var local = new Dictionary<string, MappingLocalItem>(StringComparer.OrdinalIgnoreCase);
+        foreach (var group in (await mappings.GetItemsAsync(mapping.MappingId, ct)).GroupBy(x => x.RelativePath, StringComparer.OrdinalIgnoreCase))
+        {
+            var items = group.ToList();
+            if (items.Count == 1)
+            {
+                local[group.Key] = items[0];
+            }
+            else
+            {
+                // Multiple local items with same canonical path — pick deterministic winner, log diagnostic
+                var winner = items.OrderByDescending(x => x.Mtime).First();
+                local[group.Key] = winner;
+                LogDiagnostic("PROCESS_CANONICAL_COLLISION", mapping.MappingId)( $"path={group.Key} count={items.Count}");
+            }
+        }
         var pending = await mappings.GetPendingAsync(mapping.MappingId, DateTimeOffset.UtcNow, ct);
         
         if (!string.Equals(mapping.InventoryState, "Normalized", StringComparison.OrdinalIgnoreCase))
@@ -349,7 +376,11 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
                 if (existing is null || existing.ContentHash is null) throw new SyncApiException(System.Net.HttpStatusCode.NotFound, "SYNC_CONTENT_MISSING", "Remote content metadata is unavailable.");
                 var currentItem = await api.GetItemAsync(existing.ItemId, ct);
                 var downloadPath = PathRules.ToAbsolute(mapping.LocalPath, rel); Directory.CreateDirectory(Path.GetDirectoryName(downloadPath)!);
-                await _transfers.DownloadAsync(new DownloadTarget(currentItem.ItemId, currentItem.Version, rel, currentItem.SizeBytes ?? 0, currentItem.ContentHash ?? existing.ContentHash, currentItem.MtimeUtc), downloadPath, ct);
+                // Section I fix: Acquire transport slot for concurrent download
+                using (await _scheduler.AcquireAsync(ct))
+                {
+                    await _transfers.DownloadAsync(new DownloadTarget(currentItem.ItemId, currentItem.Version, rel, currentItem.SizeBytes ?? 0, currentItem.ContentHash ?? existing.ContentHash, currentItem.MtimeUtc), downloadPath, ct);
+                }
                 var downloaded = new FileInfo(downloadPath); await mappings.UpsertItemAsync(new(mapping.MappingId, rel, ItemType.File, downloaded.Length, downloaded.LastWriteTimeUtc, SyncItemState.Synced), ct); 
                 await RecordAsync(mapping, rel, "Downloaded", "Synced", null, ct);
                 // Section 9 fix: Update last successful file sync on download too
@@ -615,7 +646,11 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
                     var conflict = ConflictCopyPath(full);
                     try
                     {
-                        await _transfers.DownloadAsync(new DownloadTarget(item.ItemId, item.Version, localRel, item.SizeBytes ?? 0, item.ContentHash, item.MtimeUtc), conflict, ct);
+                        // Section I fix: Acquire transport slot for concurrent download
+                        using (await _scheduler.AcquireAsync(ct))
+                        {
+                            await _transfers.DownloadAsync(new DownloadTarget(item.ItemId, item.Version, localRel, item.SizeBytes ?? 0, item.ContentHash, item.MtimeUtc), conflict, ct);
+                        }
                         await RecordAsync(mapping, localRel, "Conflict", "Error", "This file was changed both locally and on Oryno NAS.", ct);
                     }
                     catch (SyncApiException e) when (e.Code == "SYNC_CONTENT_MISSING")
@@ -631,7 +666,11 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
             catch (SyncApiException e) when (e.Code == "SYNC_ITEM_NOT_FOUND") { await remoteState.MarkItemMissingAsync(rootId, item.ItemId.ToString(), ct); await RecordAsync(mapping, localRel, "Download", "Error", e.Message, ct); continue; }
             try
             {
-                await _transfers.DownloadAsync(new DownloadTarget(current.ItemId, current.Version, localRel, current.SizeBytes ?? 0, current.ContentHash ?? item.ContentHash!, current.MtimeUtc), full, ct);
+                // Section I fix: Acquire transport slot for concurrent download
+                using (await _scheduler.AcquireAsync(ct))
+                {
+                    await _transfers.DownloadAsync(new DownloadTarget(current.ItemId, current.Version, localRel, current.SizeBytes ?? 0, current.ContentHash ?? item.ContentHash!, current.MtimeUtc), full, ct);
+                }
                 var info = new FileInfo(full); await mappings.UpsertItemAsync(new(mapping.MappingId, localRel, ItemType.File, info.Length, info.LastWriteTimeUtc, SyncItemState.Synced), ct);
                 await RecordAsync(mapping, localRel, "Downloaded", "Synced", null, ct);
             }

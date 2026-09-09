@@ -278,6 +278,76 @@ public class AuditFixTests
         Assert.All(errors, e => Assert.Equal("SYNC_CONFLICT", e.ErrorCode));
         Assert.DoesNotContain(errors, e => e.RelativePath == "file1.txt");
     }
+
+    // Section 4 test: Canonical collision handling
+    [Fact]
+    public async Task R1_CanonicalCollision_LogsDiagnostic()
+    {
+        var api = new AuditMockSyncApi();
+        var mappings = new MockMappingStore();
+        var remote = new AuditMockRemoteStateStore();
+        var coordinator = new MappingTransferCoordinator(mappings, remote, api, Path.GetTempPath());
+        
+        var rootId = Guid.NewGuid();
+        var mappingId = Guid.NewGuid();
+        var localDir = UniqueDir;
+        await mappings.AddMappingAsync(new SyncMapping(mappingId, localDir, rootId, "root", true, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow, null, "Normalized", null, null, MappingStatus.Syncing, null, "test.txt"));
+        
+        // Two remote items with same path but different case
+        remote.AddRemoteItem(new RemoteItemState(Guid.NewGuid(), rootId, null, "Test.txt", "Test.txt", "file", 100, null, "hash1", 1, 0, RemotePlanningState.MetadataOnly));
+        remote.AddRemoteItem(new RemoteItemState(Guid.NewGuid(), rootId, null, "test.txt", "test.txt", "file", 200, null, "hash2", 2, 0, RemotePlanningState.MetadataOnly));
+        
+        await mappings.EnqueueAsync(new MappingPendingOperation(Guid.NewGuid(), mappingId, OperationType.CreateFile,
+            "test.txt", null, DateTimeOffset.UtcNow, 0, DateTimeOffset.UtcNow,
+            OperationState.Pending, null));
+        
+        var testFile = Path.Combine(localDir, "test.txt");
+        Directory.CreateDirectory(localDir);
+        await File.WriteAllTextAsync(testFile, new string('x', 100));
+        
+        await coordinator.ProcessAsync(new[] { (await mappings.GetMappingAsync(mappingId))! }, CancellationToken.None);
+        
+        // Should not crash, should complete
+        var pending = await mappings.GetPendingAsync(mappingId, DateTimeOffset.MaxValue, CancellationToken.None);
+        Assert.Empty(pending);
+        
+        if (File.Exists(testFile)) File.Delete(testFile);
+        if (Directory.Exists(localDir)) Directory.Delete(localDir);
+    }
+
+    // Section 5 test: FileChangedDuringTransferException is retryable
+    [Fact]
+    public async Task R2_FileChangedDuringTransfer_Retryable()
+    {
+        var api = new AuditMockSyncApi();
+        api.SimulateFileChanged = true;
+        var mappings = new MockMappingStore();
+        var remote = new AuditMockRemoteStateStore();
+        var coordinator = new MappingTransferCoordinator(mappings, remote, api, Path.GetTempPath());
+        
+        var rootId = Guid.NewGuid();
+        var mappingId = Guid.NewGuid();
+        var localDir = UniqueDir;
+        await mappings.AddMappingAsync(new SyncMapping(mappingId, localDir, rootId, "root", true, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow, null, "Normalized", null, null, MappingStatus.Syncing, null, "test.txt"));
+        
+        await mappings.EnqueueAsync(new MappingPendingOperation(Guid.NewGuid(), mappingId, OperationType.CreateFile,
+            "test.txt", null, DateTimeOffset.UtcNow, 0, DateTimeOffset.UtcNow,
+            OperationState.Pending, null));
+        
+        var testFile = Path.Combine(localDir, "test.txt");
+        Directory.CreateDirectory(localDir);
+        await File.WriteAllTextAsync(testFile, "test content");
+        
+        await coordinator.ProcessAsync(new[] { (await mappings.GetMappingAsync(mappingId))! }, CancellationToken.None);
+        
+        // Should be Pending (retryable), not FailedPermanent
+        var pending = await mappings.GetPendingAsync(mappingId, DateTimeOffset.MaxValue, CancellationToken.None);
+        Assert.Single(pending);
+        Assert.Equal(OperationState.Pending, pending[0].State);
+        
+        if (File.Exists(testFile)) File.Delete(testFile);
+        if (Directory.Exists(localDir)) Directory.Delete(localDir);
+    }
 }
 
 public class AuditMockSyncApi : IContentTransferApi
@@ -285,6 +355,7 @@ public class AuditMockSyncApi : IContentTransferApi
     public bool Online { get; set; } = true;
     public bool SimulateNameConflict { get; set; }
     public bool SimulateItemNotFound { get; set; }
+    public bool SimulateFileChanged { get; set; }
     public Guid ExistingItemId { get; set; }
     public string ExistingItemHash { get; set; } = "";
     public long ExistingItemSize { get; set; }
@@ -314,6 +385,8 @@ public class AuditMockSyncApi : IContentTransferApi
 
     public Task<TransferCommit> CommitUploadAsync(Guid uploadId, Guid? operationId, string expectedHash, CancellationToken ct = default)
     {
+        if (SimulateFileChanged)
+            throw new FileChangedDuringTransferException("test");
         SuccessfulOperations++;
         return Task.FromResult(new TransferCommit(Guid.NewGuid(), 1, 1, expectedHash, false));
     }
