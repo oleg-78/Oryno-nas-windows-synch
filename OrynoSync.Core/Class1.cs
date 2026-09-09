@@ -3,7 +3,7 @@ namespace OrynoSync.Core;
 public enum ItemType { File, Directory }
 public enum SyncItemState { Synced, Waiting, Uploading, Downloading, Conflict, Error, Ignored }
 public enum OperationType { CreateFile, UpdateFile, CreateDirectory, Move, Delete, DownloadFile, DownloadDirectory, Conflict }
-public enum OperationState { Pending, InProgress, Completed, Failed, BlockedWaitingForServerCapability }
+public enum OperationState { Pending, InProgress, Retrying, Completed, Failed, FailedPermanent, BlockedWaitingForServerCapability }
 public enum EngineState { Disconnected, Connecting, AuthenticationRequired, InitialInventory, Reconciling, OnlineIdle, SyncingMetadata, Offline, Paused, ProtocolError, Error, Syncing=SyncingMetadata, UpToDate=OnlineIdle }
 public enum ConnectionState { Disconnected, Checking, ServerUnavailable, ServerReachable, Connecting, Reconnecting, Connected, AuthenticationRequired, AuthenticationExpired, ServerError, ProtocolError }
 public sealed class ConnectionStateTracker(int failureThreshold = 3)
