@@ -120,15 +120,8 @@ internal static class DependencyWavePlanner
 
                     if (!parentPending)
                     {
-                        // Parent either already completed or doesn't need an operation
-                        var parentCompleted = completed.Contains(
-                            pending.First(o => o.Type == OperationType.CreateDirectory &&
-                                string.Equals(o.RelativePath, parentPath, StringComparison.OrdinalIgnoreCase)).OperationId);
-                        if (parentCompleted || !pending.Any(o => o.Type == OperationType.CreateDirectory &&
-                            string.Equals(o.RelativePath, parentPath, StringComparison.OrdinalIgnoreCase)))
-                        {
-                            wave.Add(op);
-                        }
+                        // Parent not in pending → already exists on server or doesn't need an operation
+                        wave.Add(op);
                     }
                 }
             }
