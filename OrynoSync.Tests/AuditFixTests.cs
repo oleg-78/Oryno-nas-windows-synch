@@ -1,5 +1,6 @@
 using OrynoSync.Core;
 using System.Net;
+using System.Threading;
 
 namespace OrynoSync.Tests;
 
@@ -454,6 +455,299 @@ public class AuditFixTests
         
         // Cleanup
         if (Directory.Exists(localDir)) Directory.Delete(localDir, true);
+    }
+
+    // ===== DUPLICATE PATH BLOCKING TESTS =====
+
+    [Fact]
+    public async Task T1_DuplicatePath_BlocksPendingCreateFile()
+    {
+        var api = new AuditMockSyncApi();
+        var mappings = new MockMappingStore();
+        var remote = new AuditMockRemoteStateStore();
+        var coordinator = new MappingTransferCoordinator(mappings, remote, api, Path.GetTempPath());
+
+        var rootId = Guid.NewGuid();
+        var mappingId = Guid.NewGuid();
+        var localDir = UniqueDir;
+        await mappings.AddMappingAsync(new SyncMapping(mappingId, localDir, rootId, "root", true, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow, null, "Normalized", null, null, MappingStatus.Syncing, null, "test.txt"));
+
+        // Two remote items with same canonical path (duplicate)
+        remote.AddRemoteItem(new RemoteItemState(Guid.NewGuid(), rootId, null, "test.txt", "test.txt", "file", 100, null, "hash1", 1, 0, RemotePlanningState.MetadataOnly));
+        remote.AddRemoteItem(new RemoteItemState(Guid.NewGuid(), rootId, null, "test.txt", "test.txt", "file", 200, null, "hash2", 2, 0, RemotePlanningState.MetadataOnly));
+
+        // Existing pending CreateFile operation
+        await mappings.EnqueueAsync(new MappingPendingOperation(Guid.NewGuid(), mappingId, OperationType.CreateFile, "test.txt", null, DateTimeOffset.UtcNow, 0, DateTimeOffset.UtcNow, OperationState.Pending, null));
+
+        await coordinator.ProcessAsync(new[] { (await mappings.GetMappingAsync(mappingId))! }, CancellationToken.None);
+
+        // Operation should be FailedPermanent (blocked), NOT call API
+        var pending = await mappings.GetPendingAsync(mappingId, DateTimeOffset.MaxValue, CancellationToken.None);
+        Assert.All(pending, o => Assert.Equal(OperationState.FailedPermanent, o.State));
+        Assert.All(pending, o => Assert.Contains("Duplicate server path requires reconciliation", o.LastError));
+
+        // No upload should have been attempted
+        Assert.Equal(0, api.SuccessfulOperations);
+    }
+
+    [Fact]
+    public async Task T2_DuplicatePath_BlocksPendingCreateDirectory()
+    {
+        var api = new AuditMockSyncApi();
+        var mappings = new MockMappingStore();
+        var remote = new AuditMockRemoteStateStore();
+        var coordinator = new MappingTransferCoordinator(mappings, remote, api, Path.GetTempPath());
+
+        var rootId = Guid.NewGuid();
+        var mappingId = Guid.NewGuid();
+        var localDir = UniqueDir;
+        await mappings.AddMappingAsync(new SyncMapping(mappingId, localDir, rootId, "root", true, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow, null, "Normalized", null, null, MappingStatus.Syncing, null, "TestDir"));
+
+        // Two remote items with same canonical path (duplicate)
+        remote.AddRemoteItem(new RemoteItemState(Guid.NewGuid(), rootId, null, "TestDir", "TestDir", "directory", null, null, null, 1, 0, RemotePlanningState.MetadataOnly));
+        remote.AddRemoteItem(new RemoteItemState(Guid.NewGuid(), rootId, null, "TestDir", "TestDir", "directory", null, null, null, 2, 0, RemotePlanningState.MetadataOnly));
+
+        // Existing pending CreateDirectory operation
+        await mappings.EnqueueAsync(new MappingPendingOperation(Guid.NewGuid(), mappingId, OperationType.CreateDirectory, "TestDir", null, DateTimeOffset.UtcNow, 0, DateTimeOffset.UtcNow, OperationState.Pending, null));
+
+        await coordinator.ProcessAsync(new[] { (await mappings.GetMappingAsync(mappingId))! }, CancellationToken.None);
+
+        var pending = await mappings.GetPendingAsync(mappingId, DateTimeOffset.MaxValue, CancellationToken.None);
+        Assert.All(pending, o => Assert.Equal(OperationState.FailedPermanent, o.State));
+
+        Assert.Equal(0, api.SuccessfulOperations);
+    }
+
+    [Fact]
+    public async Task T3_DuplicatePath_BlocksDelete()
+    {
+        var api = new AuditMockSyncApi();
+        var mappings = new MockMappingStore();
+        var remote = new AuditMockRemoteStateStore();
+        var coordinator = new MappingTransferCoordinator(mappings, remote, api, Path.GetTempPath());
+
+        var rootId = Guid.NewGuid();
+        var mappingId = Guid.NewGuid();
+        var localDir = UniqueDir;
+        await mappings.AddMappingAsync(new SyncMapping(mappingId, localDir, rootId, "root", true, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow, null, "Normalized", null, null, MappingStatus.Syncing, null, "file.txt"));
+
+        // Two remote items with same canonical path (duplicate)
+        remote.AddRemoteItem(new RemoteItemState(Guid.NewGuid(), rootId, null, "file.txt", "file.txt", "file", 100, null, "hash1", 1, 0, RemotePlanningState.MetadataOnly));
+        remote.AddRemoteItem(new RemoteItemState(Guid.NewGuid(), rootId, null, "file.txt", "file.txt", "file", 200, null, "hash2", 2, 0, RemotePlanningState.MetadataOnly));
+
+        // Existing pending Delete operation
+        await mappings.EnqueueAsync(new MappingPendingOperation(Guid.NewGuid(), mappingId, OperationType.Delete, "file.txt", null, DateTimeOffset.UtcNow, 0, DateTimeOffset.UtcNow, OperationState.Pending, null));
+
+        await coordinator.ProcessAsync(new[] { (await mappings.GetMappingAsync(mappingId))! }, CancellationToken.None);
+
+        var pending = await mappings.GetPendingAsync(mappingId, DateTimeOffset.MaxValue, CancellationToken.None);
+        Assert.All(pending, o => Assert.Equal(OperationState.FailedPermanent, o.State));
+
+        Assert.Equal(0, api.SuccessfulOperations);
+    }
+
+    [Fact]
+    public async Task T4_DuplicatePath_BlocksMove()
+    {
+        var api = new AuditMockSyncApi();
+        var mappings = new MockMappingStore();
+        var remote = new AuditMockRemoteStateStore();
+        var coordinator = new MappingTransferCoordinator(mappings, remote, api, Path.GetTempPath());
+
+        var rootId = Guid.NewGuid();
+        var mappingId = Guid.NewGuid();
+        var localDir = UniqueDir;
+        await mappings.AddMappingAsync(new SyncMapping(mappingId, localDir, rootId, "root", true, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow, null, "Normalized", null, null, MappingStatus.Syncing, null, "file.txt"));
+
+        // Two remote items with same canonical path (duplicate)
+        remote.AddRemoteItem(new RemoteItemState(Guid.NewGuid(), rootId, null, "file.txt", "file.txt", "file", 100, null, "hash1", 1, 0, RemotePlanningState.MetadataOnly));
+        remote.AddRemoteItem(new RemoteItemState(Guid.NewGuid(), rootId, null, "file.txt", "file.txt", "file", 200, null, "hash2", 2, 0, RemotePlanningState.MetadataOnly));
+
+        // Existing pending Move operation
+        await mappings.EnqueueAsync(new MappingPendingOperation(Guid.NewGuid(), mappingId, OperationType.Move, "file.txt", "dest.txt", DateTimeOffset.UtcNow, 0, DateTimeOffset.UtcNow, OperationState.Pending, null));
+
+        await coordinator.ProcessAsync(new[] { (await mappings.GetMappingAsync(mappingId))! }, CancellationToken.None);
+
+        var pending = await mappings.GetPendingAsync(mappingId, DateTimeOffset.MaxValue, CancellationToken.None);
+        Assert.All(pending, o => Assert.Equal(OperationState.FailedPermanent, o.State));
+
+        Assert.Equal(0, api.SuccessfulOperations);
+    }
+
+    [Fact]
+    public async Task T5_DuplicatePath_NoTransportApiCalled()
+    {
+        var api = new AuditMockSyncApi();
+        var mappings = new MockMappingStore();
+        var remote = new AuditMockRemoteStateStore();
+        var coordinator = new MappingTransferCoordinator(mappings, remote, api, Path.GetTempPath());
+
+        var rootId = Guid.NewGuid();
+        var mappingId = Guid.NewGuid();
+        var localDir = UniqueDir;
+        await mappings.AddMappingAsync(new SyncMapping(mappingId, localDir, rootId, "root", true, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow, null, "Normalized", null, null, MappingStatus.Syncing, null, "blocked.txt"));
+
+        // Duplicate remote items
+        remote.AddRemoteItem(new RemoteItemState(Guid.NewGuid(), rootId, null, "blocked.txt", "blocked.txt", "file", 100, null, "hash1", 1, 0, RemotePlanningState.MetadataOnly));
+        remote.AddRemoteItem(new RemoteItemState(Guid.NewGuid(), rootId, null, "blocked.txt", "blocked.txt", "file", 200, null, "hash2", 2, 0, RemotePlanningState.MetadataOnly));
+
+        // Multiple pending operations on blocked path
+        await mappings.EnqueueAsync(new MappingPendingOperation(Guid.NewGuid(), mappingId, OperationType.CreateFile, "blocked.txt", null, DateTimeOffset.UtcNow, 0, DateTimeOffset.UtcNow, OperationState.Pending, null));
+        await mappings.EnqueueAsync(new MappingPendingOperation(Guid.NewGuid(), mappingId, OperationType.Delete, "blocked.txt", null, DateTimeOffset.UtcNow, 0, DateTimeOffset.UtcNow, OperationState.Pending, null));
+
+        await coordinator.ProcessAsync(new[] { (await mappings.GetMappingAsync(mappingId))! }, CancellationToken.None);
+
+        // No API calls should have been made
+        Assert.Equal(0, api.SuccessfulOperations);
+    }
+
+    [Fact]
+    public async Task T6_OldNormalizedQueue_BlockedDynamically()
+    {
+        var api = new AuditMockSyncApi();
+        var mappings = new MockMappingStore();
+        var remote = new AuditMockRemoteStateStore();
+        var coordinator = new MappingTransferCoordinator(mappings, remote, api, Path.GetTempPath());
+
+        var rootId = Guid.NewGuid();
+        var mappingId = Guid.NewGuid();
+        var localDir = UniqueDir;
+        await mappings.AddMappingAsync(new SyncMapping(mappingId, localDir, rootId, "root", true, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow, null, "Normalized", null, null, MappingStatus.Syncing, null, "dup.txt"));
+
+        // Duplicate remote items
+        remote.AddRemoteItem(new RemoteItemState(Guid.NewGuid(), rootId, null, "dup.txt", "dup.txt", "file", 100, null, "hash1", 1, 0, RemotePlanningState.MetadataOnly));
+        remote.AddRemoteItem(new RemoteItemState(Guid.NewGuid(), rootId, null, "dup.txt", "dup.txt", "file", 200, null, "hash2", 2, 0, RemotePlanningState.MetadataOnly));
+
+        // Old pending operation from before duplicate was detected
+        await mappings.EnqueueAsync(new MappingPendingOperation(Guid.NewGuid(), mappingId, OperationType.CreateFile, "dup.txt", null, DateTimeOffset.UtcNow, 0, DateTimeOffset.UtcNow, OperationState.Pending, null));
+
+        // Process twice to simulate poll cycle
+        await coordinator.ProcessAsync(new[] { (await mappings.GetMappingAsync(mappingId))! }, CancellationToken.None);
+        await coordinator.ProcessAsync(new[] { (await mappings.GetMappingAsync(mappingId))! }, CancellationToken.None);
+
+        var pending = await mappings.GetPendingAsync(mappingId, DateTimeOffset.MaxValue, CancellationToken.None);
+        Assert.All(pending, o => Assert.Equal(OperationState.FailedPermanent, o.State));
+
+        Assert.Equal(0, api.SuccessfulOperations);
+    }
+
+    [Fact]
+    public async Task T7_DuplicateDiagnostic_Deduplicated()
+    {
+        var api = new AuditMockSyncApi();
+        var mappings = new MockMappingStore();
+        var remote = new AuditMockRemoteStateStore();
+        var coordinator = new MappingTransferCoordinator(mappings, remote, api, Path.GetTempPath());
+
+        int diagnosticCount = 0;
+        coordinator.DiagnosticLog += _ => Interlocked.Increment(ref diagnosticCount);
+
+        var rootId = Guid.NewGuid();
+        var mappingId = Guid.NewGuid();
+        var localDir = UniqueDir;
+        await mappings.AddMappingAsync(new SyncMapping(mappingId, localDir, rootId, "root", true, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow, null, "Normalized", null, null, MappingStatus.Syncing, null, "dup.txt"));
+
+        // Duplicate remote items
+        remote.AddRemoteItem(new RemoteItemState(Guid.NewGuid(), rootId, null, "dup.txt", "dup.txt", "file", 100, null, "hash1", 1, 0, RemotePlanningState.MetadataOnly));
+        remote.AddRemoteItem(new RemoteItemState(Guid.NewGuid(), rootId, null, "dup.txt", "dup.txt", "file", 200, null, "hash2", 2, 0, RemotePlanningState.MetadataOnly));
+
+        // Process multiple times (simulating polls)
+        for (int i = 0; i < 5; i++)
+        {
+            await coordinator.ProcessAsync(new[] { (await mappings.GetMappingAsync(mappingId))! }, CancellationToken.None);
+        }
+
+        // Should only log diagnostic ONCE (deduplicated), not 5 times
+        Assert.Equal(1, diagnosticCount);
+    }
+
+    [Fact]
+    public async Task T8_Diagnostic_NotInUserActivity()
+    {
+        var api = new AuditMockSyncApi();
+        var mappings = new MockMappingStore();
+        var remote = new AuditMockRemoteStateStore();
+        var coordinator = new MappingTransferCoordinator(mappings, remote, api, Path.GetTempPath());
+
+        int activityCount = 0;
+        coordinator.Activity += _ => Interlocked.Increment(ref activityCount);
+
+        var rootId = Guid.NewGuid();
+        var mappingId = Guid.NewGuid();
+        var localDir = UniqueDir;
+        await mappings.AddMappingAsync(new SyncMapping(mappingId, localDir, rootId, "root", true, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow, null, "Normalized", null, null, MappingStatus.Syncing, null, "dup.txt"));
+
+        // Duplicate remote items
+        remote.AddRemoteItem(new RemoteItemState(Guid.NewGuid(), rootId, null, "dup.txt", "dup.txt", "file", 100, null, "hash1", 1, 0, RemotePlanningState.MetadataOnly));
+        remote.AddRemoteItem(new RemoteItemState(Guid.NewGuid(), rootId, null, "dup.txt", "dup.txt", "file", 200, null, "hash2", 2, 0, RemotePlanningState.MetadataOnly));
+
+        await coordinator.ProcessAsync(new[] { (await mappings.GetMappingAsync(mappingId))! }, CancellationToken.None);
+
+        // Activity should NOT contain diagnostic events
+        var activity = await mappings.GetRecentActivityAsync(20, CancellationToken.None);
+        foreach (var a in activity) Assert.NotEqual("Diagnostic", a.Status);
+    }
+
+    [Fact]
+    public async Task T9_NameExists_DuplicatePath_NotRetried()
+    {
+        var api = new AuditMockSyncApi();
+        var mappings = new MockMappingStore();
+        var remote = new AuditMockRemoteStateStore();
+        var coordinator = new MappingTransferCoordinator(mappings, remote, api, Path.GetTempPath());
+
+        var rootId = Guid.NewGuid();
+        var mappingId = Guid.NewGuid();
+        var localDir = UniqueDir;
+        await mappings.AddMappingAsync(new SyncMapping(mappingId, localDir, rootId, "root", true, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow, null, "Normalized", null, null, MappingStatus.Syncing, null, "dup.txt"));
+
+        // Duplicate remote items
+        remote.AddRemoteItem(new RemoteItemState(Guid.NewGuid(), rootId, null, "dup.txt", "dup.txt", "file", 100, null, "hash1", 1, 0, RemotePlanningState.MetadataOnly));
+        remote.AddRemoteItem(new RemoteItemState(Guid.NewGuid(), rootId, null, "dup.txt", "dup.txt", "file", 200, null, "hash2", 2, 0, RemotePlanningState.MetadataOnly));
+
+        // Pending CreateFile
+        await mappings.EnqueueAsync(new MappingPendingOperation(Guid.NewGuid(), mappingId, OperationType.CreateFile, "dup.txt", null, DateTimeOffset.UtcNow, 0, DateTimeOffset.UtcNow, OperationState.Pending, null));
+
+        await coordinator.ProcessAsync(new[] { (await mappings.GetMappingAsync(mappingId))! }, CancellationToken.None);
+
+        // Should be FailedPermanent (not retried)
+        var pending = await mappings.GetPendingAsync(mappingId, DateTimeOffset.MaxValue, CancellationToken.None);
+        Assert.All(pending, o => Assert.Equal(OperationState.FailedPermanent, o.State));
+        Assert.All(pending, o => Assert.Equal(DateTimeOffset.MaxValue, o.NextAttemptAt));
+    }
+
+    [Fact]
+    public async Task T10_SameHashExistingFile_BindsSuccessfully()
+    {
+        var api = new AuditMockSyncApi();
+        api.ExistingItemHash = "abc123";
+        api.ExistingItemSize = 100;
+        var mappings = new MockMappingStore();
+        var remote = new AuditMockRemoteStateStore();
+        var coordinator = new MappingTransferCoordinator(mappings, remote, api, Path.GetTempPath());
+
+        var fileId = Guid.NewGuid();
+        var rootId = Guid.NewGuid();
+        remote.AddRemoteItem(new RemoteItemState(fileId, rootId, null, "test.txt", "test.txt", "file", 100, null, "abc123", 1, 0, RemotePlanningState.MetadataOnly));
+
+        var mappingId = Guid.NewGuid();
+        var localDir = UniqueDir;
+        await mappings.AddMappingAsync(new SyncMapping(mappingId, localDir, rootId, "root", true, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow, null, "Normalized", null, null, MappingStatus.Syncing, null, "test.txt"));
+
+        await mappings.EnqueueAsync(new MappingPendingOperation(Guid.NewGuid(), mappingId, OperationType.CreateFile, "test.txt", null, DateTimeOffset.UtcNow, 0, DateTimeOffset.UtcNow, OperationState.Pending, null));
+
+        var testFile = Path.Combine(localDir, "test.txt");
+        Directory.CreateDirectory(localDir);
+        await File.WriteAllTextAsync(testFile, new string('x', 100));
+
+        await coordinator.ProcessAsync(new[] { (await mappings.GetMappingAsync(mappingId))! }, CancellationToken.None);
+
+        // Should complete (hash match → bind)
+        var pending = await mappings.GetPendingAsync(mappingId, DateTimeOffset.MaxValue, CancellationToken.None);
+        Assert.Empty(pending);
+
+        if (File.Exists(testFile)) File.Delete(testFile);
+        if (Directory.Exists(localDir)) Directory.Delete(localDir);
     }
 }
 

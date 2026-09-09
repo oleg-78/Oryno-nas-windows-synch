@@ -77,6 +77,10 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
     private static readonly IgnoreRules _ignores = new();
     private readonly IContentHasher _hasher = new Blake3ContentHasher();
     public event Action<SyncActivityEvent>? Activity;
+    public event Action<SyncActivityEvent>? DiagnosticLog;
+
+    private readonly HashSet<string> _blockedCanonicalPaths = new(StringComparer.OrdinalIgnoreCase);
+    private readonly DuplicateDiagnosticDedup _diagnosticDedup = new();
 
     public int ActiveTransfers => _scheduler.ActiveCount;
 
@@ -97,7 +101,7 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
         
         // Section C: Authoritative duplicate resolution instead of GroupBy.First
         var remoteResolution = DuplicateCanonicalResolver.ResolveRemote(remoteItems,
-            (path, rootId, ids) => LogDiagnostic("REBUILD_DUPLICATE", mapping.MappingId)( $"path={path} ids={ids}"));
+            (path, rootId, ids) => LogDiagnosticDeduped("REBUILD_DUPLICATE", mapping.MappingId, path, ids));
         
         if (remoteResolution.Conflicts.Count > 0)
         {
@@ -140,7 +144,8 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
                 // Mutation on this path is blocked by DuplicateCanonicalResolver
                 var winner = groupItems.OrderByDescending(x => x.Version).ThenByDescending(x => x.LastRevision).First();
                 remoteByPath[group.Key] = winner;
-                LogDiagnostic("REBUILD_CANONICAL_COLLISION", mapping.MappingId)( $"path={group.Key} count={groupItems.Count} ids={string.Join(",", groupItems.Select(x => x.ItemId.ToString("N").Substring(0, 8)))}");
+                var ids = string.Join(",", groupItems.Select(x => x.ItemId.ToString("N").Substring(0, 8)));
+                LogDiagnosticDeduped("REBUILD_CANONICAL_COLLISION", mapping.MappingId, group.Key, ids);
             }
         }
         var items = desired.Select(item => new MappingLocalItem(mapping.MappingId, item.RelativePath, item.ItemType, item.Size, item.Mtime, item.ItemType == ItemType.File && remoteByPath.TryGetValue(item.RelativePath, out var r) && string.Equals(item.ContentHash, r.ContentHash, StringComparison.OrdinalIgnoreCase) ? SyncItemState.Synced : SyncItemState.Waiting)).ToArray();
@@ -168,14 +173,24 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
         // Section C: Authoritative duplicate resolution
         var remoteItems = (await remoteState.GetRemoteItemsAsync(rootId, ct)).Where(x => !x.IsDeleted).ToArray();
         var remoteResolution = DuplicateCanonicalResolver.ResolveRemote(remoteItems,
-            (path, rootId, ids) => LogDiagnostic("PROCESS_DUPLICATE", mapping.MappingId)( $"path={path} ids={ids}"));
+            (path, rootId, ids) => LogDiagnosticDeduped("PROCESS_DUPLICATE", mapping.MappingId, path, ids));
         var remote = remoteResolution.Items.ToDictionary(x => x.RelativePath, StringComparer.OrdinalIgnoreCase);
+        
+        // FIX: Track blocked canonical paths to prevent any mutation operations on them
+        _blockedCanonicalPaths.Clear();
+        foreach (var conflict in remoteResolution.Conflicts)
+        {
+            _blockedCanonicalPaths.Add(PathRules.NormalizeRelative(conflict));
+        }
         
         if (remoteResolution.Conflicts.Count > 0)
         {
             var details = string.Join("; ", remoteResolution.Conflicts.Select(d => d));
             await RecordAsync(mapping, "", "Sync", "Info", $"Blocked {remoteResolution.Conflicts.Count} ambiguous paths from mutation: {details}", ct);
         }
+        
+        // FIX: Block existing pending operations on conflict paths BEFORE scheduler
+        await BlockPendingOperationsOnConflictPathsAsync(mapping, ct);
         
         // Section 4 fix: Explicit canonical collision handling for local items
         var local = new Dictionary<string, MappingLocalItem>(StringComparer.OrdinalIgnoreCase);
@@ -191,7 +206,8 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
                 // Multiple local items with same canonical path — pick deterministic winner, log diagnostic
                 var winner = items.OrderByDescending(x => x.Mtime).First();
                 local[group.Key] = winner;
-                LogDiagnostic("PROCESS_CANONICAL_COLLISION", mapping.MappingId)( $"path={group.Key} count={items.Count}");
+                var ids = string.Join(",", items.Select(x => x.RelativePath));
+                LogDiagnosticDeduped("PROCESS_CANONICAL_COLLISION", mapping.MappingId, group.Key, ids);
             }
         }
         var pending = await mappings.GetPendingAsync(mapping.MappingId, DateTimeOffset.UtcNow, ct);
@@ -359,6 +375,14 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
         Dictionary<string, RemoteItemState> remote, IReadOnlyDictionary<string, MappingLocalItem> local, CancellationToken ct)
     {
         var rel = PathRules.NormalizeRelative(op.RelativePath);
+        
+        // FIX: Block any mutation operation on a duplicate canonical path
+        if (IsMutationOperation(op.Type) && _blockedCanonicalPaths.Contains(rel))
+        {
+            throw new SyncApiException(System.Net.HttpStatusCode.Conflict, "SYNC_CONFLICT",
+                $"Duplicate server path requires reconciliation: {op.RelativePath}");
+        }
+        
         if (_ignores.IsIgnored(rel) || (op.Type == OperationType.Move && op.SecondaryPath is not null && _ignores.IsIgnored(op.SecondaryPath)))
         {
             await mappings.UpdateOperationAsync(op with { State = OperationState.Completed, LastError = null, NextAttemptAt = DateTimeOffset.MaxValue }, ct);
@@ -818,6 +842,59 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
     }
     
     /// <summary>
+    /// FIX: Determines if an operation type is a server mutation (vs read-only/download).
+    /// </summary>
+    private static bool IsMutationOperation(OperationType type) => type switch
+    {
+        OperationType.CreateFile or OperationType.UpdateFile or OperationType.CreateDirectory
+            or OperationType.Move or OperationType.Delete => true,
+        _ => false
+    };
+    
+    /// <summary>
+    /// FIX: Block existing pending operations on conflict paths by marking them FailedPermanent.
+    /// This prevents old CreateFile/CreateDirectory/etc. operations from executing after duplicate detection.
+    /// </summary>
+    private async Task BlockPendingOperationsOnConflictPathsAsync(SyncMapping mapping, CancellationToken ct)
+    {
+        if (_blockedCanonicalPaths.Count == 0) return;
+        
+        var pending = await mappings.GetPendingAsync(mapping.MappingId, DateTimeOffset.UtcNow, ct);
+        foreach (var op in pending)
+        {
+            if (op.State != OperationState.Pending) continue;
+            if (!IsMutationOperation(op.Type)) continue;
+            
+            var rel = PathRules.NormalizeRelative(op.RelativePath);
+            if (_blockedCanonicalPaths.Contains(rel))
+            {
+                await mappings.UpdateOperationAsync(op with 
+                { 
+                    State = OperationState.FailedPermanent, 
+                    AttemptCount = op.AttemptCount + 1,
+                    LastError = $"Duplicate server path requires reconciliation: {op.RelativePath}",
+                    NextAttemptAt = DateTimeOffset.MaxValue 
+                }, ct);
+                await RecordAsync(mapping, op.RelativePath, op.Type.ToString(), "Conflict", 
+                    $"Blocked by duplicate path: {op.RelativePath}", ct);
+            }
+        }
+    }
+    
+    /// <summary>
+    /// FIX: Deduplicated diagnostic logging — only logs when duplicate set changes.
+    /// </summary>
+    private void LogDiagnosticDeduped(string category, Guid mappingId, string path, string ids)
+    {
+        if (_diagnosticDedup.ShouldLog(mappingId, path, ids))
+        {
+            var message = $"path={path} ids={ids}";
+            var evt = new SyncActivityEvent(Guid.NewGuid(), mappingId, "", category, "Diagnostic", DateTimeOffset.UtcNow, null, message);
+            DiagnosticLog?.Invoke(evt);
+        }
+    }
+    
+    /// <summary>
     /// Section 8 fix: LogDiagnostic now actually persists diagnostic events.
     /// Writes to a dedicated diagnostic log that doesn't pollute user activity.
     /// </summary>
@@ -826,9 +903,30 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
         return message => 
         {
             var evt = new SyncActivityEvent(Guid.NewGuid(), mappingId, "", category, "Diagnostic", DateTimeOffset.UtcNow, null, message);
-            // Fire and forget — diagnostic events go to Activity for debug logging
-            Activity?.Invoke(evt);
+            // Fire and forget — diagnostic events go to DiagnosticLog (not Activity)
+            DiagnosticLog?.Invoke(evt);
             return evt;
         };
+    }
+}
+
+/// <summary>
+/// FIX: Deduplicates duplicate-detection diagnostics.
+/// For each (mappingId, canonical_path) pair, only logs when the set of duplicate item IDs changes.
+/// Prevents spamming PROCESS_DUPLICATE every 2-4 seconds for the same duplicates.
+/// </summary>
+internal sealed class DuplicateDiagnosticDedup
+{
+    private readonly Dictionary<(Guid, string), string> _lastSeen = new();
+
+    public bool ShouldLog(Guid mappingId, string path, string ids)
+    {
+        var key = (mappingId, path);
+        if (_lastSeen.TryGetValue(key, out var lastIds) && lastIds == ids)
+        {
+            return false; // Same duplicate set — don't spam
+        }
+        _lastSeen[key] = ids;
+        return true;
     }
 }
