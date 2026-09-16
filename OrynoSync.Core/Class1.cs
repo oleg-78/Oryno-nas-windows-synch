@@ -3,7 +3,10 @@ namespace OrynoSync.Core;
 public enum ItemType { File, Directory }
 public enum SyncItemState { Synced, Waiting, Uploading, Downloading, Conflict, Error, Ignored }
 public enum OperationType { CreateFile, UpdateFile, CreateDirectory, Move, Delete, DownloadFile, DownloadDirectory, Conflict }
-public enum OperationState { Pending, InProgress, Retrying, Completed, Failed, FailedPermanent, BlockedWaitingForServerCapability }
+public enum OperationState { Pending, InProgress, Retrying, Completed, Failed, FailedPermanent, BlockedWaitingForServerCapability, Cancelled, Resolved, Archived }
+/// <summary>Lifecycle of a queue entry as the UI must present it:
+/// Active = needs a human now, Retrying = transient and self-healing, Historical = resolved/archived.</summary>
+public enum ErrorLifecycle { None, Active, Retrying, Historical }
 public enum EngineState { Disconnected, Connecting, AuthenticationRequired, InitialInventory, Reconciling, OnlineIdle, SyncingMetadata, Offline, Paused, ProtocolError, Error, Syncing=SyncingMetadata, UpToDate=OnlineIdle }
 public enum ConnectionState { Disconnected, Checking, ServerUnavailable, ServerReachable, Connecting, Reconnecting, Connected, AuthenticationRequired, AuthenticationExpired, ServerError, ProtocolError }
 public sealed class ConnectionStateTracker(int failureThreshold = 3)
@@ -25,10 +28,10 @@ public sealed record LocalItem(string RelativePath, ItemType ItemType, long Size
 public sealed record PendingOperation(Guid OperationId, OperationType Type, string RelativePath, string? SecondaryPath = null, DateTimeOffset? CreatedAt = null, int AttemptCount = 0, DateTimeOffset? NextAttemptAt = null, OperationState State = OperationState.Pending, string? LastError = null);
 public sealed record ActivityEntry(string RelativePath, string Action, string Status, DateTimeOffset Timestamp, string? Error = null);
 public sealed record ScanProgress(int FilesFound, int FoldersFound, int ChangesIndexed, bool IsComplete = false);
-public sealed record SyncDashboardSummary(int IndexedFiles, int WaitingCount, int ErrorCount, int FolderCount, DateTimeOffset? LastSuccessfulFileSync);
-public sealed record SyncMappingSummary(Guid MappingId, int IndexedFiles, int WaitingCount, int ErrorCount, DateTimeOffset? LastSuccessfulFileSync);
+public sealed record SyncDashboardSummary(int IndexedFiles, int WaitingCount, int ErrorCount, int FolderCount, DateTimeOffset? LastSuccessfulFileSync, int HistoricalErrorCount = 0);
+public sealed record SyncMappingSummary(Guid MappingId, int IndexedFiles, int WaitingCount, int ErrorCount, DateTimeOffset? LastSuccessfulFileSync, int HistoricalErrorCount = 0);
 public sealed record SyncActivityEvent(Guid EventId, Guid? MappingId, string? RelativePath, string Action, string Status, DateTimeOffset Timestamp, string? ErrorCode = null, string? ErrorMessage = null);
-public sealed record SyncFileError(Guid OperationId, Guid MappingId, string RelativePath, string Operation, string ErrorCode, string UserMessage, string? TechnicalMessage, int AttemptCount, DateTimeOffset LastAttemptAt);
+public sealed record SyncFileError(Guid OperationId, Guid MappingId, string RelativePath, string Operation, string ErrorCode, string UserMessage, string? TechnicalMessage, int AttemptCount, DateTimeOffset LastAttemptAt, string State = "Failed", ErrorLifecycle Lifecycle = ErrorLifecycle.Active);
 
 public static class UserFacingErrorMapper
 {

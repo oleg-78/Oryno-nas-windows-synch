@@ -189,7 +189,7 @@ public sealed class RemoteStateStore(string databasePath) : IRemoteStateStore
         chkTable.Transaction = tx;
         if (Convert.ToInt32(await chkTable.ExecuteScalarAsync(ct)) == 0)
             return false;
-        await using var current = c.CreateCommand("SELECT EXISTS(SELECT 1 FROM mapping_pending_operations mp JOIN sync_mappings m ON mp.mapping_id=m.mapping_id WHERE m.server_root_id=$root AND mp.relative_path=$p AND mp.state<>'Completed' AND mp.state<>'FailedPermanent')");
+        await using var current = c.CreateCommand($"SELECT EXISTS(SELECT 1 FROM mapping_pending_operations mp JOIN sync_mappings m ON mp.mapping_id=m.mapping_id WHERE m.server_root_id=$root AND mp.relative_path=$p AND mp.state IN ({SqliteSyncMappingStore.LiveStatesSql},{SqliteSyncMappingStore.ActiveErrorStatesSql}))");
         current.Transaction = tx;
         Add(current.Parameters, "$root", rootId.ToString());
         Add(current.Parameters, "$p", normalized);

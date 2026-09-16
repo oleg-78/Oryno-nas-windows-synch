@@ -456,7 +456,7 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
         // Case 3: Not in cache → try to create
         try
         {
-            var parentItemId = FindParent(remote, remoteRel);
+            var parentItemId = await EnsureParentAsync(rootId, remote, remoteRel, ct);
             var folder = await api.CreateFolderAsync(rootId, parentItemId, Path.GetFileName(remoteRel), op.OperationId, ct);
             
             remote[remoteRel] = new RemoteItemState(folder.ItemId, rootId, folder.ParentItemId, folder.Name, 
@@ -540,8 +540,8 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
                 $"Cannot create file {remoteRel}: a directory with this name exists on server");
         }
         
-        // Case 4: Upload
-        var parentItemId = FindParent(remote, remoteRel);
+        // Case 4: Upload — родитель резолвится/досоздаётся на сервере, в корень не уходим.
+        var parentItemId = await EnsureParentAsync(rootId, remote, remoteRel, ct);
         try
         {
             // Section I fix: Acquire transport slot for concurrent transfer
@@ -627,7 +627,7 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
         var destRemote = mapping.Scope(destination);
         
         // Use authoritative server response
-        var moveResponse = await api.MoveItemAsync(moved.ItemId, FindParent(remote, destRemote), Path.GetFileName(destRemote), moved.Version, op.OperationId, ct);
+        var moveResponse = await api.MoveItemAsync(moved.ItemId, await EnsureParentAsync(rootId, remote, destRemote, ct), Path.GetFileName(destRemote), moved.Version, op.OperationId, ct);
         
         // Section 7 fix: Remove old path, add new path with authoritative data
         remote.Remove(remoteRel);
@@ -742,18 +742,29 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
         {
             try
             {
-                // Fetch authoritative inventory from server
-                var page = await metadataApi.GetInventoryPageAsync(rootId, null, 5000, ct);
+                // Fetch authoritative inventory from server.
+                // §4: сервер разрешает limit ≤ 2000 (FastAPI Query(ge=1, le=MAX_PAGE)); раньше
+                // здесь стоял 5000 → HTTP 422, поэтому разрешение конфликта имени (409) всегда
+                // падало и операция уходила в FailedPermanent. Качаем страницами ≤ 500.
+                var all = new List<RemoteItemDto>();
+                string? cursor = null;
+                for (var pageIndex = 0; pageIndex < 40; pageIndex++)
+                {
+                    var page = await metadataApi.GetInventoryPageAsync(rootId, cursor, 500, ct);
+                    all.AddRange(page.Items);
+                    cursor = page.NextCursor;
+                    if (string.IsNullOrEmpty(cursor) || page.Items.Count == 0) break;
+                }
                 
                 // Persist fresh data into RemoteStateStore (real server → SQLite)
                 await remoteState.RefreshFromServerAsync(rootId, (r, c) =>
                 {
                     // Return the fetched items as the "fetcher" result
-                    return Task.FromResult<IReadOnlyList<RemoteItemDto>>(page.Items);
+                    return Task.FromResult<IReadOnlyList<RemoteItemDto>>(all);
                 }, ct);
                 
                 // Now look up in the freshly updated remote dictionary
-                foreach (var item in page.Items)
+                foreach (var item in all)
                 {
                     if (string.Equals(PathRules.NormalizeRelative(item.RelativePath), remoteRel, StringComparison.OrdinalIgnoreCase))
                     {
@@ -828,6 +839,56 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
 
     private async Task<string> HashAsync(string path, CancellationToken ct) { await _hashGate.WaitAsync(ct); try { return await _hasher.ComputeAsync(path, ct); } finally { _hashGate.Release(); } }
     
+    /// <summary>
+    /// Резолвит родителя для server-relative пути, ДОСОЗДАВАЯ отсутствующую цепочку папок
+    /// на сервере. Раньше при отсутствии родителя в локальном кэше FindParent возвращал null,
+    /// и upload уходил в КОРЕНЬ root'а — так файлы попадали вне выбранной папки-приёмника
+    /// (root-level pollution). POST /roots/{id}/folders идемпотентен на сервере
+    /// (существующая папка возвращается тем же item_id), поэтому проход по цепочке безопасен.
+    /// </summary>
+    private async Task<Guid?> EnsureParentAsync(Guid rootId, Dictionary<string, RemoteItemState> remote, string remoteRel, CancellationToken ct)
+    {
+        var parent = Path.GetDirectoryName(remoteRel)?.Replace('/', '\\');
+        if (string.IsNullOrWhiteSpace(parent)) return null;               // сам корень назначения
+        if (remote.TryGetValue(parent, out var cached) && cached.ItemType.Equals("directory", StringComparison.OrdinalIgnoreCase))
+            return cached.ItemId;
+        Guid? currentParent = null;
+        var currentRel = string.Empty;
+        foreach (var part in parent.Split('\\', StringSplitOptions.RemoveEmptyEntries))
+        {
+            currentRel = currentRel.Length == 0 ? part : $"{currentRel}\\{part}";
+            if (remote.TryGetValue(currentRel, out var known) && known.ItemType.Equals("directory", StringComparison.OrdinalIgnoreCase))
+            {
+                currentParent = known.ItemId;
+                continue;
+            }
+            RemoteItemDto folder;
+            try
+            {
+                folder = await api.CreateFolderAsync(rootId, currentParent, part, Guid.NewGuid(), ct);
+            }
+            catch (SyncApiException e) when (e.Code == "SYNC_NAME_CONFLICT")
+            {
+                // Папка уже существует: не валим операцию, а привязываемся к существующей
+                // (серверная сторона отдаёт имя-конфликт, когда запись есть в БД).
+                var actual = await FindActualServerItemAsync(rootId, currentRel, remote, ct);
+                if (actual is null) throw;
+                if (!actual.ItemType.Equals("directory", StringComparison.OrdinalIgnoreCase))
+                    throw new SyncApiException(System.Net.HttpStatusCode.Conflict, "SYNC_CONFLICT",
+                        $"a file already exists where the folder is required: {currentRel}");
+                remote[currentRel] = actual;
+                currentParent = actual.ItemId;
+                continue;
+            }
+            remote[currentRel] = new RemoteItemState(folder.ItemId, rootId, folder.ParentItemId, folder.Name,
+                folder.RelativePath, folder.ItemType, folder.SizeBytes, folder.MtimeUtc, folder.ContentHash,
+                folder.Version, 0, RemotePlanningState.MetadataOnly);
+            currentParent = folder.ItemId;
+            SyncDiagnostics.Report("REMOTE_FOLDER_ENSURE", $"root={rootId} path={currentRel} item={folder.ItemId}");
+        }
+        return currentParent;
+    }
+
     private static Guid? FindParent(IReadOnlyDictionary<string, RemoteItemState> remote, string path) 
     { 
         var parent = Path.GetDirectoryName(path)?.Replace('/', '\\'); 

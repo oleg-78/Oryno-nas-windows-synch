@@ -8,6 +8,14 @@ public partial class ActivityView : WpfUserControl
     private void StartSync_Click(object sender, RoutedEventArgs e) => (DataContext as ActivityViewModel)?.StartSync?.Invoke();
     private void StopSync_Click(object sender, RoutedEventArgs e) => (DataContext as ActivityViewModel)?.StopSync?.Invoke();
     private void OpenFolder_Click(object sender, RoutedEventArgs e) => (DataContext as ActivityViewModel)?.OpenFolder?.Invoke();
+    /// <summary>§18: manual retry for one card, or for every active card at once.</summary>
+    private void RetryOperation_Click(object sender, RoutedEventArgs e)
+    {
+        if (DataContext is not ActivityViewModel vm) return;
+        if ((sender as System.Windows.FrameworkElement)?.DataContext is SyncFileErrorRowViewModel row) row.Retry?.Invoke();
+        else vm.RetryOperation?.Invoke(Guid.Empty);
+    }
+    private void RetryAll_Click(object sender, RoutedEventArgs e) => (DataContext as ActivityViewModel)?.RetryErrors?.Invoke();
     private void ToggleErrors_Click(object sender, RoutedEventArgs e)
     {
         if (DataContext is not ActivityViewModel vm) return;

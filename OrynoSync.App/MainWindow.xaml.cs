@@ -60,7 +60,7 @@ public partial class MainWindow : Window
         _mappingRuntime.Progress += (mapping, progress) => Dispatcher.BeginInvoke(() => ApplyMappingProgress(mapping, progress));
         _credentials = new WindowsCredentialStore(Path.Combine(_appData, "Credentials"));
         _activityVm.StartSync = () => _ = GlobalStartSyncAsync();
-        _activityVm.StopSync = () => GlobalStopSync();
+        _activityVm.StopSync = () => _ = GlobalStopSync();
         _activityVm.OpenFolder = OpenFolder_Click;
         _foldersVm.AddFolder = AddFolder;
         _foldersVm.OpenFolder = OpenFolder_Click;
@@ -70,7 +70,12 @@ public partial class MainWindow : Window
         _settingsVm.Reauthorize = ReauthorizeAsync;
         _settingsVm.DatabasePath = DatabasePath;
         _settingsVm.InitializeStartup();
+        // Core-layer diagnostics (§4) go to the same support log as the HTTP trace.
+        SyncDiagnostics.Sink = DiagnosticsLogger.Write;
+        _settingsVm.SaveSetting = (key, value) => _ = _mappingStore.SaveSettingAsync(key, value);
         _settingsVm.Device = Environment.MachineName + " - Windows";
+        _activityVm.RetryErrors = () => _ = RetryActiveErrorsAsync();
+        _activityVm.RetryOperation = id => _ = RetryOperationAsync(id);
         Loaded += LoadedAsync;
         NavigateTo(AppPage.Activity);
         var timer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(500) };
@@ -113,6 +118,12 @@ public partial class MainWindow : Window
         await _mappingRuntime.RestoreAsync();
         InitializeProductionClient();
         RestartRemoteLoop();
+        // §1/§14: the persisted autostart choice wins over the install default.
+        var startWithWindows = await _mappingStore.GetSettingAsync("start_with_windows");
+        if (startWithWindows is not null) _settingsVm.ApplyStartupSetting(string.Equals(startWithWindows, "true", StringComparison.OrdinalIgnoreCase));
+        DiagnosticsLogger.Write("AUTOSTART_EFFECTIVE", WindowsAutostart.Describe().Replace(Environment.NewLine, " | "));
+        // §7/§8/§9/§11: classify the errors the queue carried over and clean dead rows before the UI counts them.
+        await ReconcileErrorsAsync("app-start");
         await RefreshCountersAsync();
     }
 
@@ -134,9 +145,39 @@ public partial class MainWindow : Window
     {
         var handler = new BearerTokenHandler(ct => reader(CredentialAccount(uri), ct))
         {
-            InnerHandler = new HttpDiagnosticsHandler(uri) { InnerHandler = new SocketsHttpHandler { ConnectTimeout = TimeSpan.FromSeconds(8), PooledConnectionLifetime = TimeSpan.FromMinutes(10) } }
+            InnerHandler = new HttpDiagnosticsHandler(uri) { InnerHandler = new SocketsHttpHandler { UseProxy = SystemProxyUsable(), ConnectTimeout = TimeSpan.FromSeconds(8), PooledConnectionLifetime = TimeSpan.FromMinutes(10) } }
         };
         return new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(20) };
+    }
+
+    private static bool? _systemProxyUsable;
+
+    /// <summary>
+    /// §4: системный прокси может быть ЗАДАН в HKCU, но не работать (после reboot прокси-клиент
+    /// не стартует автоматически) — тогда все запросы к NAS падают с ConnectionError, хотя сеть и
+    /// сервер доступны напрямую. Проверяем прокси один раз и используем его только если он живой.
+    /// </summary>
+    private static bool SystemProxyUsable()
+    {
+        if (_systemProxyUsable is bool cached) return cached;
+        var usable = true;
+        var detail = "none";
+        try
+        {
+            var target = new Uri("https://oryno-nas.remo78.ru");
+            var candidate = System.Net.Http.HttpClient.DefaultProxy?.GetProxy(target);
+            if (candidate is not null && !string.Equals(candidate.Host, target.Host, StringComparison.OrdinalIgnoreCase))
+            {
+                detail = $"{candidate.Host}:{candidate.Port}";
+                using var probe = new System.Net.Sockets.TcpClient();
+                var connect = probe.ConnectAsync(candidate.Host, candidate.Port);
+                usable = connect.Wait(TimeSpan.FromSeconds(1)) && probe.Connected;
+            }
+        }
+        catch { usable = true; }
+        _systemProxyUsable = usable;
+        DiagnosticsLogger.Write("PROXY_STATE", $"system_proxy={detail} reachable={usable} use_proxy={usable} note={(usable ? "traffic via proxy" : "proxy ignored, direct connection to NAS")}");
+        return usable;
     }
 
     private async Task RemoteLoopAsync(CancellationToken ct)
@@ -294,22 +335,66 @@ public partial class MainWindow : Window
         return summary;
     }
 
+    /// <summary>
+    /// §7/§8/§9/§11: decide what each carried-over error really is right now, archive the ones that are
+    /// already resolved or orphaned, re-arm the transient ones and clean dead queue rows. Writes the
+    /// BEFORE/AFTER numbers to the support log and the activity feed.
+    /// </summary>
+    public async Task<string> ReconcileErrorsAsync(string reason)
+    {
+        var before = await _mappingStore.GetDashboardSummaryAsync();
+        var beforeBreakdown = await _mappingStore.GetQueueBreakdownAsync();
+        var mappings = await _mappingStore.GetMappingsAsync();
+        var report = await ErrorReconcileRunner.ReconcileAsync(_mappingStore, _remoteStore, mappings, HashLocalAsync);
+        var purged = await _mappingStore.PurgeStaleOperationsAsync();
+        var after = await _mappingStore.GetDashboardSummaryAsync();
+        var afterBreakdown = await _mappingStore.GetQueueBreakdownAsync();
+        var duplicates = await _mappingStore.GetDuplicateLiveOperationsAsync();
+        var line = $"reason={reason} {report.Describe(before.ErrorCount)} purged_stale_rows={purged} " +
+                   $"waiting={beforeBreakdown.LiveCount}->{afterBreakdown.LiveCount} duplicate_live_groups={duplicates.Count} " +
+                   $"last_successful_sync={after.LastSuccessfulFileSync?.ToString("O") ?? "none"}";
+        DiagnosticsLogger.Write("ERROR_RECONCILE_SUMMARY", line);
+        if (report.Total > 0 || purged > 0)
+            AddActivity($"Errors reconciled ({reason}): active {before.ErrorCount} → {after.ErrorCount}, resolved/archived {report.Resolved + report.StaleOrphan}, stale queue rows removed {purged}.");
+        return line;
+    }
+
+    private async Task<string?> HashLocalAsync(string path, CancellationToken ct)
+    {
+        try { return await new Blake3ContentHasher().ComputeAsync(path, ct); }
+        catch (Exception) { return null; }
+    }
+
+    /// <summary>§18: manual retry for the files the user still sees as active problems.</summary>
+    private async Task RetryActiveErrorsAsync()
+    {
+        var errors = await _mappingStore.GetErrorsAsync(500);
+        var retryable = errors.Where(x => x.Lifecycle != ErrorLifecycle.Historical).ToArray();
+        foreach (var error in retryable) await _mappingStore.ReArmOperationAsync(error.OperationId, "manual retry");
+        AddActivity(retryable.Length == 0 ? "Nothing to retry." : $"Retry queued for {retryable.Length:N0} file(s).");
+        await ReconcileErrorsAsync("manual-retry");
+        await RefreshCountersAsync();
+    }
+
+    private async Task RetryOperationAsync(Guid operationId)
+    {
+        await _mappingStore.ReArmOperationAsync(operationId, "manual retry");
+        AddActivity("Retry queued for the selected file.");
+        await RefreshCountersAsync();
+    }
+
     private void SetConnection(ConnectionResult result, int failures)
     {
+        failures = _connectionTracker.ConsecutiveFailures;
         var state = _connectionTracker.Observe(result.Status);
         if (result.Status == ConnectionStatus.TlsError) state = ConnectionState.ProtocolError;
         if (result.Status == ConnectionStatus.ProtocolError) state = ConnectionState.ServerError;
-        failures = _connectionTracker.ConsecutiveFailures;
-        var message = result.Status switch
-        {
-            ConnectionStatus.AuthenticationRequired => "Server is reachable. Authorization is required.",
-            ConnectionStatus.AuthenticationRevoked => "Authorization expired. Local changes are safe.",
-            ConnectionStatus.TlsError => "TLS certificate or handshake error.",
-            ConnectionStatus.ProtocolError => "Server reached, but its response was invalid.",
-            _ when failures < 3 => "Reconnecting to Oryno NAS...",
-            _ => "Oryno NAS is unavailable. Local changes are safe."
-        };
+        // §4: full diagnostic (endpoint, status, content-type, safe body sample, parse error, expected
+        // schema) goes to the support log; §5 decides between "Server error" and "Connected + issue".
+        DiagnosticsLogger.Write("CONNECTION_DIAGNOSTIC", ConnectionDiagnostics.DescribeLogLine(result, failures));
+        var message = ConnectionDiagnostics.DescribeMessage(result, failures);
         SetConnectionState(state, message);
+        SyncDiagnostics.Report("CONNECTION_LABEL", $"label={ConnectionDiagnostics.Label(result)} status={result.Status} server_error={ConnectionDiagnostics.IsServerError(result)}");
     }
 
     private void SetConnectionState(ConnectionState state, string message)
@@ -408,7 +493,7 @@ public partial class MainWindow : Window
             {
                 card.Open = () => OpenMapping(card.LocalPath);
                 card.StartSync = () => _ = StartMappingAsync(card.Mapping);
-                card.StopSync = () => StopMapping(card.Mapping);
+                card.StopSync = () => _ = StopMappingAsync(card.Mapping);
                 card.Rebuild = () => RebuildMapping(card.Mapping);
                 card.Remove = () => RemoveMapping(card.Mapping);
                 card.Repair = () => RepairMapping(card.Mapping);
@@ -488,44 +573,53 @@ public partial class MainWindow : Window
 
     private async Task StartMappingAsync(SyncMapping mapping)
     {
-        // If inventory not built yet (ReadyForPreflight or Stopped without plan), rebuild first
-        if (mapping.Status is MappingStatus.ReadyForPreflight or MappingStatus.Stopped)
+        var current = await _mappingStore.GetMappingAsync(mapping.MappingId) ?? mapping;
+        // §12: Start is idempotent — a second click must not build a second plan or a second engine.
+        if (_mappingRuntime.ActiveMappings.Contains(current.MappingId) && current.Status is MappingStatus.Syncing or MappingStatus.Scanning)
         {
-            if (_transfer is not null && mapping.ServerRootId is not null)
+            AddActivity($"Sync already running for {current.LocalPath} — Start ignored.");
+            await RefreshMappingsAsync();
+            return;
+        }
+        // If inventory not built yet (ReadyForPreflight or Stopped without plan), rebuild first
+        if (current.Status is MappingStatus.ReadyForPreflight or MappingStatus.Stopped)
+        {
+            if (_transfer is not null && current.ServerRootId is not null)
             {
-                var result = await _transfer.RebuildAsync(mapping);
-                mapping = await _mappingStore.GetMappingAsync(mapping.MappingId) ?? mapping;
+                var result = await _transfer.RebuildAsync(current);
+                current = await _mappingStore.GetMappingAsync(current.MappingId) ?? current;
                 AddActivity($"Sync plan built: {result.NormalizedPendingCount} operations queued.");
             }
         }
-        // Now start: set status to Syncing and start runtime
-        await _mappingRuntime.StartSyncAsync(mapping);
-        AddActivity($"Sync started for {mapping.LocalPath}: transfers beginning.");
+        // Now start: persists desired state (enabled=true) and begins transfers (§2).
+        await _mappingRuntime.StartSyncAsync(current);
+        AddActivity($"Sync started for {current.LocalPath}: transfers beginning.");
         await RefreshMappingsAsync();
     }
 
-    private void StopMapping(SyncMapping mapping)
+    private async Task StopMappingAsync(SyncMapping mapping)
     {
-        // Stop = disable scheduler; keep watcher running to detect changes
-        _mappingRuntime.Stop(mapping.MappingId);
-        AddActivity($"Sync stopped for {mapping.LocalPath}.");
-        _ = RefreshMappingsAsync();
+        // §2/§15: Stop persists the user's decision — after an app restart or a reboot this mapping
+        // stays Stopped, and queued local changes are kept for the next Start.
+        await _mappingRuntime.StopAsync(mapping);
+        AddActivity($"Sync stopped for {mapping.LocalPath}. Local changes stay queued for the next Start.");
+        await RefreshMappingsAsync();
     }
 
     private async Task GlobalStartSyncAsync()
     {
-        foreach (var mapping in _mappings.Where(x => x.Enabled && x.ServerRootId is not null))
+        foreach (var mapping in _mappings.Where(x => x.ServerRootId is not null))
             await StartMappingAsync(mapping);
         _activityVm.SyncRunning = true;
     }
 
-    private void GlobalStopSync()
+    private async Task GlobalStopSync()
     {
         foreach (var mapping in _mappings)
-            _mappingRuntime.Stop(mapping.MappingId);
+            await _mappingRuntime.StopAsync(mapping);
         _activityVm.SyncRunning = false;
-        AddActivity("All sync stopped.");
-        _ = RefreshMappingsAsync();
+        AddActivity("All sync stopped. Mappings stay stopped after a restart.");
+        await RefreshMappingsAsync();
     }
 
     private async Task ChooseDestinationAsync(SyncMapping mapping)
@@ -633,7 +727,7 @@ public partial class MainWindow : Window
     }
 
     private HttpClient CreateTokenHttpClient(Uri uri, string token) =>
-        new(new BearerTokenHandler(_ => Task.FromResult<string?>(token)) { InnerHandler = new HttpDiagnosticsHandler(uri) { InnerHandler = new SocketsHttpHandler { ConnectTimeout = TimeSpan.FromSeconds(8) } } })
+        new(new BearerTokenHandler(_ => Task.FromResult<string?>(token)) { InnerHandler = new HttpDiagnosticsHandler(uri) { InnerHandler = new SocketsHttpHandler { UseProxy = SystemProxyUsable(), ConnectTimeout = TimeSpan.FromSeconds(8) } } })
         { Timeout = TimeSpan.FromSeconds(20) };
 
     private Uri? TryGetServerUri() => Uri.TryCreate(_settingsVm.ServerUrl, UriKind.Absolute, out var uri) ? uri : null;
@@ -712,7 +806,7 @@ public partial class MainWindow : Window
         var menu = new Forms.ContextMenuStrip();
         _trayStatus = new Forms.ToolStripMenuItem("Oryno Sync — Starting") { Enabled = false };
         _traySyncNow = new Forms.ToolStripMenuItem("Start syncing", null, (_, _) => { if (!_paused) { _ = GlobalStartSyncAsync(); } });
-        _trayPause = new Forms.ToolStripMenuItem("Stop syncing", null, (_, _) => { GlobalStopSync(); });
+        _trayPause = new Forms.ToolStripMenuItem("Stop syncing", null, (_, _) => { _ = GlobalStopSync(); });
         menu.Items.Add(_trayStatus);
         menu.Items.Add("Open Oryno Sync", null, (_, _) => ShowFromTray());
         menu.Items.Add(_traySyncNow);

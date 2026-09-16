@@ -1,6 +1,6 @@
 namespace OrynoSync.Core;
 
-public sealed class SyncMappingRuntimeManager(ISyncMappingStore store)
+public sealed class SyncMappingRuntimeManager(ISyncMappingStore store) : IDisposable
 {
     private readonly Dictionary<Guid, Runtime> _runtimes = [];
 
@@ -8,17 +8,41 @@ public sealed class SyncMappingRuntimeManager(ISyncMappingStore store)
     public event Action<SyncMapping, ScanProgress>? Progress;
     public IReadOnlyCollection<Guid> ActiveMappings => _runtimes.Keys.ToArray();
 
-    public async Task RestoreAsync(CancellationToken ct = default)
+    /// <summary>
+    /// §2/§13/§15: the persisted desired state decides what happens after a restart.
+    /// Enabled=true → continuous sync resumes without any click; Enabled=false → it stays Stopped.
+    /// </summary>
+    public async Task<IReadOnlyList<Guid>> RestoreAsync(CancellationToken ct = default)
     {
+        var resumed = new List<Guid>();
         foreach (var mapping in await store.GetMappingsAsync(ct))
-            if (mapping.Enabled) await StartAsync(mapping, ct);
+        {
+            if (!mapping.Enabled)
+            {
+                SyncDiagnostics.Report("SYNC_RESTORE", $"mapping={mapping.MappingId} desired=enabled:false action=stay_stopped path={mapping.LocalPath}");
+                continue;
+            }
+            await StartAsync(mapping, ct);
+            var current = await store.GetMappingAsync(mapping.MappingId, ct);
+            if (current is not null && current.Status is MappingStatus.Stopped or MappingStatus.ReadyForPreflight or MappingStatus.ReadyToSync or MappingStatus.Offline)
+                await SetStatusAsync(current, MappingStatus.Syncing, null, ct);
+            resumed.Add(mapping.MappingId);
+            SyncDiagnostics.Report("SYNC_RESTORE", $"mapping={mapping.MappingId} desired=enabled:true action=auto_resume path={mapping.LocalPath}");
+        }
+        return resumed;
     }
 
     // Starts the watcher and schedules reconciliation. It intentionally does not
     // await the scan: callers can close a dialog and keep using the app.
     public async Task StartAsync(SyncMapping mapping, CancellationToken ct = default)
     {
-        Stop(mapping.MappingId);
+        // §12: Start is idempotent — never spin up a second engine (watcher/scan loop) for a mapping.
+        if (_runtimes.TryGetValue(mapping.MappingId, out var existing))
+        {
+            existing.StartScan();
+            SyncDiagnostics.Report("SYNC_START", $"mapping={mapping.MappingId} action=noop reason=already_running");
+            return;
+        }
         if (!Directory.Exists(mapping.LocalPath))
         {
             await SetStatusAsync(mapping, MappingStatus.LocalFolderUnavailable, "Local folder unavailable", ct);
@@ -41,6 +65,17 @@ public sealed class SyncMappingRuntimeManager(ISyncMappingStore store)
         runtime.Start();
     }
 
+    /// <summary>§2/§12: persists the user's decision — Start means enabled, Stop means disabled.</summary>
+    public async Task SetDesiredStateAsync(SyncMapping mapping, bool enabled, CancellationToken ct = default)
+    {
+        var current = await store.GetMappingAsync(mapping.MappingId, ct) ?? mapping;
+        var status = enabled ? MappingStatus.Syncing : MappingStatus.Stopped;
+        var updated = current with { Enabled = enabled, Status = status, LastError = enabled ? current.LastError : null, UpdatedAt = DateTimeOffset.UtcNow };
+        await store.UpdateMappingAsync(updated, ct);
+        SyncDiagnostics.Report("SYNC_DESIRED_STATE", $"mapping={mapping.MappingId} enabled={enabled.ToString().ToLowerInvariant()} status={status}");
+        Progress?.Invoke(updated, new ScanProgress(0, 0, 0));
+    }
+
     public async Task StartSyncAsync(SyncMapping mapping, CancellationToken ct = default)
     {
         if (mapping.ServerRootId is null)
@@ -49,8 +84,15 @@ public sealed class SyncMappingRuntimeManager(ISyncMappingStore store)
             return;
         }
         // Transition: ReadyForPreflight/ReadyToSync → Syncing (transfers begin)
-        await SetStatusAsync(mapping, MappingStatus.Syncing, null, ct);
+        await SetDesiredStateAsync(mapping, true, ct);
         if (_runtimes.TryGetValue(mapping.MappingId, out var runtime)) runtime.StartScan();
+    }
+
+    /// <summary>§2/§15: a user Stop survives an app restart; local changes stay queued for the next Start.</summary>
+    public async Task StopAsync(SyncMapping mapping, CancellationToken ct = default)
+    {
+        Stop(mapping.MappingId);
+        await SetDesiredStateAsync(mapping, false, ct);
     }
 
     public async Task SetPausedAsync(SyncMapping mapping, bool paused, CancellationToken ct = default)

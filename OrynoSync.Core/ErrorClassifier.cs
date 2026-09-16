@@ -45,6 +45,8 @@ public static class ErrorClassifier
             SyncApiException sae when sae.Status == HttpStatusCode.Unauthorized => new ErrorInfo(Category.Authentication, "Authorization expired. Local changes are safe.", "AUTH_EXPIRED"),
             SyncApiException sae when sae.Status == HttpStatusCode.Forbidden => new ErrorInfo(Category.Authentication, "Access denied. Check your credentials.", "AUTH_DENIED"),
             SyncApiException sae when sae.Code == "REVISION_REGRESSION" => new ErrorInfo(Category.RevisionRegression, "Server revision changed. Re-scanning.", "REVISION_REGRESSION"),
+            SyncApiException sae when sae.Status == HttpStatusCode.TooManyRequests => new ErrorInfo(Category.ServerSemantic, "Server is rate-limiting uploads. Retrying with backoff — local changes are safe.", "UPLOAD_RATE_LIMITED", true),
+            SyncApiException sae when sae.Status == HttpStatusCode.RequestTimeout => new ErrorInfo(Category.Network, "Server timed out. Retrying — local changes are safe.", "SERVER_TIMEOUT", true),
             SyncApiException sae when (int)sae.Status >= 400 && (int)sae.Status < 500 => new ErrorInfo(Category.ServerSemantic, $"Sync issue: {sae.Code ?? "server rejected an operation"}", "SERVER_SEMANTIC"),
             SyncApiException sae when (int)sae.Status >= 500 => new ErrorInfo(Category.ServerSemantic, $"Server error ({(int)sae.Status}). Local changes are safe.", "SERVER_ERROR", true),
             SyncApiException => new ErrorInfo(Category.ServerSemantic, "Sync communication issue. Local changes are safe.", "SERVER_SEMANTIC"),

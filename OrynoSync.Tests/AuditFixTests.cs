@@ -772,8 +772,12 @@ public class AuditMockSyncApi : IContentTransferApi, ISyncMetadataApi
     public Task<IReadOnlyList<SyncRootDto>> GetSyncRootsAsync(CancellationToken ct = default) =>
         Task.FromResult<IReadOnlyList<SyncRootDto>>(Array.Empty<SyncRootDto>());
     
+    /// <summary>Запрошенные limit'ы инвентаря: сервер принимает ≤ 2000, иначе 422.</summary>
+    public readonly List<int> InventoryLimits = new();
+
     public Task<InventoryPageDto> GetInventoryPageAsync(Guid rootId, string? cursor, int limit, CancellationToken ct = default)
     {
+        InventoryLimits.Add(limit);
         ServerRefreshCallCount++;
         // Return the existing item as the "server" response for real refresh tests
         var items = new List<RemoteItemDto>();
@@ -817,8 +821,13 @@ public class AuditMockSyncApi : IContentTransferApi, ISyncMetadataApi
         return Task.FromResult(new TransferCommit(Guid.NewGuid(), 1, 1, expectedHash, false));
     }
 
+    /// <summary>Записанные вызовы создания папок: (parent, name) — для проверки, что клиент
+    /// не отправляет файлы в корень, а резолвит папку-приёмник.</summary>
+    public readonly List<(Guid? ParentItemId, string Name)> FolderCalls = new();
+
     public Task<RemoteItemDto> CreateFolderAsync(Guid rootId, Guid? parentItemId, string name, Guid operationId, CancellationToken ct = default)
     {
+        FolderCalls.Add((parentItemId, name));
         if (SimulateNameConflict)
             throw new SyncApiException(HttpStatusCode.Conflict, "SYNC_NAME_CONFLICT", "name exists");
         
@@ -994,4 +1003,59 @@ public class MockMappingStore : ISyncMappingStore
         foreach (var o in operations) EnqueueAsync(o, ct);
         return Task.CompletedTask;
     }
+    // ---- error lifecycle / queue hygiene (§7, §8, §9, §11) ----
+    private readonly List<ArchivedError> _history = new();
+    private readonly Dictionary<string, string> _settings = new();
+    public Task<IReadOnlyList<MappingPendingOperation>> GetOperationsForReconcileAsync(Guid? mappingId = null, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<MappingPendingOperation>>(_operations
+            .Where(o => (mappingId is null || o.MappingId == mappingId) && (o.State == OperationState.Failed || o.State == OperationState.FailedPermanent)).ToList());
+    public Task ArchiveOperationsAsync(IReadOnlyList<ArchivedError> items, CancellationToken ct = default)
+    {
+        foreach (var item in items)
+        {
+            var op = _operations.FirstOrDefault(o => o.OperationId == item.OperationId);
+            _history.Add(op is null ? item : item with { RelativePath = op.RelativePath, Operation = op.Type.ToString() });
+        }
+        _operations.RemoveAll(o => items.Any(i => i.OperationId == o.OperationId));
+        return Task.CompletedTask;
+    }
+    public Task ReArmOperationAsync(Guid operationId, string reason, CancellationToken ct = default)
+    {
+        var idx = _operations.FindIndex(o => o.OperationId == operationId);
+        if (idx >= 0) _operations[idx] = _operations[idx] with { State = OperationState.Pending, AttemptCount = 0, LastError = null, NextAttemptAt = DateTimeOffset.UtcNow };
+        return Task.CompletedTask;
+    }
+    public Task SetOperationErrorAsync(Guid operationId, string message, CancellationToken ct = default)
+    {
+        var idx = _operations.FindIndex(o => o.OperationId == operationId);
+        if (idx >= 0) _operations[idx] = _operations[idx] with { LastError = message };
+        return Task.CompletedTask;
+    }
+    public Task<IReadOnlyList<ErrorHistoryRow>> GetErrorHistoryAsync(int limit = 200, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<ErrorHistoryRow>>(_history
+            .Select(h => new ErrorHistoryRow(h.OperationId, h.MappingId, h.RelativePath, h.Operation, h.Outcome, h.Reason, h.UserMessage, h.ArchivedAt))
+            .Take(limit).ToList());
+    public Task<int> CountHistoricalErrorsAsync(CancellationToken ct = default) => Task.FromResult(_history.Count);
+    public Task<QueueBreakdown> GetQueueBreakdownAsync(CancellationToken ct = default)
+    {
+        var byState = _operations.GroupBy(o => o.State.ToString()).ToDictionary(g => g.Key, g => g.Count());
+        var live = _operations.Where(o => o.State is OperationState.Pending or OperationState.Retrying or OperationState.InProgress or OperationState.BlockedWaitingForServerCapability).ToList();
+        var byType = live.GroupBy(o => o.Type.ToString()).ToDictionary(g => g.Key, g => g.Count());
+        var dupes = live.GroupBy(o => (o.MappingId, o.Type, o.RelativePath)).Count(g => g.Count() > 1);
+        return Task.FromResult(new QueueBreakdown(byState, byType, live.Count, dupes));
+    }
+    public Task<IReadOnlyList<DuplicateOperationGroup>> GetDuplicateLiveOperationsAsync(CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<DuplicateOperationGroup>>(_operations
+            .Where(o => o.State is OperationState.Pending or OperationState.Retrying)
+            .GroupBy(o => (o.MappingId, o.Type, o.RelativePath))
+            .Where(g => g.Count() > 1)
+            .Select(g => new DuplicateOperationGroup(g.Key.MappingId, g.Key.Type.ToString(), g.Key.RelativePath, g.Count(), string.Join(",", g.Select(x => x.State.ToString()))))
+            .ToList());
+    public Task<int> PurgeStaleOperationsAsync(CancellationToken ct = default)
+    {
+        var removed = _operations.RemoveAll(o => o.State == OperationState.Cancelled || string.IsNullOrWhiteSpace(o.RelativePath));
+        return Task.FromResult(removed);
+    }
+    public Task<string?> GetSettingAsync(string key, CancellationToken ct = default) => Task.FromResult(_settings.TryGetValue(key, out var value) ? value : null);
+    public Task SaveSettingAsync(string key, string value, CancellationToken ct = default) { _settings[key] = value; return Task.CompletedTask; }
 }
