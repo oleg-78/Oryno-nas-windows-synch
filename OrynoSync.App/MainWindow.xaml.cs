@@ -41,8 +41,21 @@ public partial class MainWindow : Window
     private readonly FoldersView _foldersView;
     private readonly SettingsView _settingsView;
     private string _lastConnectionVisual = "";
-    private string _lastSyncVisual = "";
     private ConnectionState? _lastConnectionState;
+    /// <summary>§1/§2/§6: single writer for the user-visible status. Internal phases never reach it.</summary>
+    private readonly SyncUserStatusPresenter _statusPresenter = new();
+    /// <summary>§9: pulsed by the local watcher so queued work never waits for the remote poll.</summary>
+    private readonly SyncWakeSignal _wake = new();
+    /// <summary>§8: startup/reconnect/user Start/next-destination refresh the server immediately.</summary>
+    private readonly RemotePollSchedule _pollSchedule = new();
+    /// <summary>§10: drains the queue at once while work exists.</summary>
+    private readonly QueueDrainer _queueDrainer = new();
+    /// <summary>§13: files this client materialises must not be uploaded straight back.</summary>
+    private readonly LocalMutationSuppression _suppression = new();
+    private SyncDashboardSummary? _lastSummary;
+    /// <summary>§11: true only while queued work is being executed, so a real local change can show "Syncing".</summary>
+    private bool _draining;
+    private string _lastVisibleStatus = "";
 
     private string DatabasePath => Path.Combine(_appData, "oryno-sync.db");
 
@@ -55,7 +68,9 @@ public partial class MainWindow : Window
         _store = new SqliteLocalStateStore(DatabasePath);
         _remoteStore = new RemoteStateStore(DatabasePath);
         _mappingStore = new SqliteSyncMappingStore(DatabasePath);
-        _mappingRuntime = new SyncMappingRuntimeManager(_mappingStore);
+        _mappingRuntime = new SyncMappingRuntimeManager(_mappingStore) { Wake = _wake, Suppression = _suppression };
+        // §1/§2/§6/§7: the status line has exactly one writer, and it only speaks when the visible text changes.
+        _statusPresenter.Changed += OnUserStatusChanged;
         _mappingRuntime.Activity += (mapping, text) => { AddActivity($"{Path.GetFileName(mapping.LocalPath)} - {text}"); if (mapping.ServerRootId is null) DiagnosticsLogger.Write("FOLDER_BLOCKED", $"folder_id={mapping.MappingId} local_path={mapping.LocalPath} remote_root_id=none remote_path=none state=ServerRootUnavailable reason=NAS destination missing"); };
         _mappingRuntime.Progress += (mapping, progress) => Dispatcher.BeginInvoke(() => ApplyMappingProgress(mapping, progress));
         _credentials = new WindowsCredentialStore(Path.Combine(_appData, "Credentials"));
@@ -136,8 +151,18 @@ public partial class MainWindow : Window
         _http = CreateHttpClient(uri, _credentials.ReadAsync);
         _api = new OrynoNasSyncApi(_http, uri);
         _metadata = new MetadataSyncCoordinator(_api, _remoteStore);
-        _metadata.Progress += progress => Dispatcher.BeginInvoke(() => SetSyncStatus(progress.State, progress.Message));
-        _transfer = new MappingTransferCoordinator(_mappingStore, _remoteStore, _api, Path.Combine(_appData, "Transfers"));
+        // §5: the metadata phase is internal. It may record that real changes arrived and may wake the
+        // queue, but it never writes a "Checking…"/"Metadata…" string into the status line.
+        _metadata.Progress += progress =>
+        {
+            if (progress.Changes == 0) return;
+            // §4/§22: the server really returned changes — record it for the support log and wake the queue
+            // so any downloads it produced start now. The status follows the *work* (pending/active), never
+            // the poll itself; the client's own uploads echo back through /changes and must not flash "Syncing".
+            DiagnosticsLogger.Write("REMOTE_CHANGE", $"applied={progress.Changes} revision={progress.Revision}");
+            _wake.Pulse();
+        };
+        _transfer = new MappingTransferCoordinator(_mappingStore, _remoteStore, _api, Path.Combine(_appData, "Transfers")) { Wake = _wake, Suppression = _suppression };
         _transfer.Activity += activity => Dispatcher.BeginInvoke(() => _activityVm.Add($"{activity.Timestamp.LocalDateTime:t}  {activity.RelativePath}  {activity.Action}"));
     }
 
@@ -180,6 +205,11 @@ public partial class MainWindow : Window
         return usable;
     }
 
+    /// <summary>
+    /// §7/§8/§9/§10/§11/§18: connected idle mode polls remote metadata once a minute. A local change pulses
+    /// the wake signal, so the queue is drained immediately instead of waiting for the poll; startup,
+    /// reconnect and a user Start still refresh the server at once (RemotePollSchedule).
+    /// </summary>
     private async Task RemoteLoopAsync(CancellationToken ct)
     {
         while (!ct.IsCancellationRequested)
@@ -187,60 +217,37 @@ public partial class MainWindow : Window
             if (_paused) { await Delay(1000, ct); continue; }
             try
             {
-                if (_api is null || _metadata is null) { await Delay(4000, ct); continue; }
-                var connection = await _api.TestConnectionAsync(ct);
-                if (connection.Status != ConnectionStatus.Connected)
+                if (_api is null || _metadata is null) { await Delay(1000, ct); continue; }
+                var wait = _pollSchedule.WaitBeforeNextPoll();
+                if (wait > TimeSpan.Zero)
                 {
-                    _failures++;
-                    SetConnection(connection, _failures);
-                    await Delay(BackoffMs(), ct);
-                    continue;
+                    // §9/§10: no local work yet - sleep the idle interval, but wake the instant the watcher or a
+                    // user action asks for the queue.
+                    if (await _wake.WaitAsync(wait, ct))
+                    {
+                        DiagnosticsLogger.Write("POLL_SKIP", $"reason=local_change pulses={_wake.PulseCount} idle_poll_s={(int)SyncCadence.RemotePollInterval.TotalSeconds} pending={_lastSummary?.WaitingCount ?? 0}");
+                        await DrainQueueAsync("local-change", ct);
+                        continue;
+                    }
+                    if (ct.IsCancellationRequested) break;
                 }
-                _failures = 0;
-                _connectionTracker.Observe(ConnectionStatus.Connected);
-                SetConnectionState(ConnectionState.Connected, "Connected to Oryno NAS.");
-                var roots = await _metadata.GetRootsAsync(ct);
-                await Dispatcher.InvokeAsync(() => PopulateRoots(roots));
-                var mappings = await _mappingStore.GetMappingsAsync(ct);
-                foreach (var mapping in mappings.Where(x => x.Enabled && x.ServerRootId is not null))
-                {
-                    await _metadata.RunCycleAsync(mapping.ServerRootId!.Value, ct);
-                    await RefreshRemoteAsync(mapping.ServerRootId.Value, ct);
-                }
-                if (_transfer is not null) await _transfer.ProcessAsync(mappings, ct);
-                foreach (var mapping in mappings.Where(x => x.Enabled && x.ServerRootId is not null))
-                {
-                    var pending = await _mappingStore.PendingCountAsync(mapping.MappingId, ct);
-                    var current = await _mappingStore.GetMappingAsync(mapping.MappingId, ct);
-                    if (current is not null && current.Status is not MappingStatus.Paused and not MappingStatus.ReadyForPreflight and not MappingStatus.ReadyToSync and not MappingStatus.Stopped)
-                        await _mappingStore.UpdateMappingAsync(current with { Status = pending == 0 ? MappingStatus.UpToDate : MappingStatus.Syncing, LastError = null, UpdatedAt = DateTimeOffset.UtcNow }, ct);
-                }
-                var summary = await RefreshCountersAsync();
-                // Determine sync status for display
-                var anySyncing = mappings.Any(x => x.Status is MappingStatus.Syncing or MappingStatus.Scanning);
-                var anyStopped = mappings.Any(x => x.Status is MappingStatus.Stopped or MappingStatus.ReadyForPreflight or MappingStatus.ReadyToSync);
-                if (mappings.Count == 0) SetSyncStatus(EngineState.OnlineIdle, "Add a local folder to start syncing.");
-                else if (summary.ErrorCount > 0) SetSyncStatus(EngineState.Error, "Sync issues need attention");
-                else if (anySyncing && summary.WaitingCount > 0) SetSyncStatus(EngineState.Syncing, "Syncing files...");
-                else if (anySyncing) SetSyncStatus(EngineState.Syncing, "Syncing files...");
-                else if (anyStopped && summary.WaitingCount > 0) SetSyncStatus(EngineState.OnlineIdle, "Changes waiting");
-                else if (summary.WaitingCount > 0) SetSyncStatus(EngineState.Syncing, "Changes waiting safely");
-                else SetSyncStatus(EngineState.UpToDate, "Up to date");
-                await Delay(4000, ct);
+                await PollRemoteOnceAsync(ct);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
             catch (SyncApiException ex) when (ex.Status == System.Net.HttpStatusCode.Unauthorized)
             {
                 DiagnosticsLogger.Write("CONNECTION_FAILURE", $"old_state={_lastConnectionState?.ToString() ?? "None"} new_state=AuthenticationExpired reason=HTTP unauthorized exception_type={ex.GetType().Name} http_status={(int)ex.Status} endpoint={DiagnosticsLogger.SafeEndpoint(TryGetServerUri())} retry={_failures} retry_delay_ms={BackoffMs()} network={DiagnosticsLogger.NetworkState()} auth={(_settingsVm.HasCredential ? "present" : "missing")}");
                 SetConnectionState(ConnectionState.AuthenticationExpired, "Authorization expired. Local changes are safe.");
-                await Delay(BackoffMs(), ct);
+                _pollSchedule.RequestImmediate("retry-after-auth");
+                await Delay(SyncCadence.ErrorRetryInterval, ct);
             }
             catch (SyncApiException ex)
             {
                 DiagnosticsLogger.Write("SYNC_FAILURE", $"reason={SafeError(ex)} exception_type={ex.GetType().Name} http_status={(int)ex.Status} endpoint={DiagnosticsLogger.SafeEndpoint(TryGetServerUri())} retry={_failures} network={DiagnosticsLogger.NetworkState()} auth={(_settingsVm.HasCredential ? "present" : "missing")}");
-                SetSyncStatus(EngineState.Error, $"Sync issue: {ex.Code ?? "server rejected an operation"}");
                 AddActivity($"Sync error - {SafeError(ex)}");
-                await Delay(4000, ct);
+                ApplyUserStatus("api-error");
+                _pollSchedule.RequestImmediate("retry-after-error");
+                await Delay(SyncCadence.ErrorRetryInterval, ct);
             }
             catch (Exception ex)
             {
@@ -274,9 +281,10 @@ public partial class MainWindow : Window
                 {
                     DiagnosticsLogger.Write(errorInfo.LogType, $"reason={errorInfo.UserMessage} exception_type={ex.GetType().Name} http_status={(ex as SyncApiException is { } api ? (int)api.Status : 0)} endpoint={DiagnosticsLogger.SafeEndpoint(TryGetServerUri())}");
                     AddActivity($"Sync error - {errorInfo.UserMessage}");
-                    SetSyncStatus(EngineState.Error, $"Sync issue: {errorInfo.UserMessage}");
+                    ApplyUserStatus("server-semantic");
                     // Connection remains Connected — do not increment _failures
-                    await Delay(4000, ct);
+                    _pollSchedule.RequestImmediate("retry-after-error");
+                    await Delay(SyncCadence.ErrorRetryInterval, ct);
                     continue;
                 }
 
@@ -285,15 +293,133 @@ public partial class MainWindow : Window
                 // must NOT trigger Reconnecting state.
                 DiagnosticsLogger.Write(errorInfo.LogType, $"reason={errorInfo.UserMessage} exception_type={ex.GetType().Name} message={ex.Message} stack={ex.StackTrace}");
                 AddActivity($"Sync error - {errorInfo.UserMessage}");
-                SetSyncStatus(EngineState.Error, $"Sync issues need attention");
+                ApplyUserStatus("app-error");
                 // Connection remains Connected — do not increment _failures
-                await Delay(4000, ct);
+                _pollSchedule.RequestImmediate("retry-after-error");
+                await Delay(SyncCadence.ErrorRetryInterval, ct);
             }
         }
     }
 
+    /// <summary>
+    /// §7/§11: one full remote pass — the only place that asks the server for metadata. Called on the idle
+    /// cadence (a minute), or immediately after startup/reconnect/a user Start.
+    /// </summary>
+    private async Task PollRemoteOnceAsync(CancellationToken ct)
+    {
+        var started = Stopwatch.StartNew();
+        var connection = await _api!.TestConnectionAsync(ct);
+        if (connection.Status != ConnectionStatus.Connected)
+        {
+            _failures++;
+            SetConnection(connection, _failures);
+            _pollSchedule.RequestImmediate("reconnect");   // §8: try again as soon as the backoff expires
+            await Delay(BackoffMs(), ct);
+            return;
+        }
+        _failures = 0;
+        _connectionTracker.Observe(ConnectionStatus.Connected);
+        SetConnectionState(ConnectionState.Connected, "Connected to Oryno NAS.");
+        var roots = await _metadata!.GetRootsAsync(ct);
+        await Dispatcher.InvokeAsync(() => PopulateRoots(roots));
+        var mappings = await _mappingStore.GetMappingsAsync(ct);
+        _mappings = mappings;
+        foreach (var mapping in mappings.Where(x => x.Enabled && x.ServerRootId is not null))
+        {
+            await _metadata.RunCycleAsync(mapping.ServerRootId!.Value, ct);
+            await RefreshRemoteAsync(mapping.ServerRootId.Value, ct);
+        }
+        if (_transfer is not null) await _transfer.ProcessAsync(mappings, ct);
+        await UpdateMappingStatusesAsync(mappings, ct);
+        await RefreshCountersAsync();
+        ApplyUserStatus("poll-cycle");
+        DiagnosticsLogger.Write("POLL_CYCLE", $"cycle_ms={started.ElapsedMilliseconds} mappings={mappings.Count} pending={_lastSummary?.WaitingCount ?? 0} errors={_lastSummary?.ErrorCount ?? 0} visible=\"{_lastVisibleStatus}\"");
+    }
+
+    /// <summary>
+    /// §9/§10: local work path. No remote metadata request happens here — the watcher already told us what
+    /// changed, so this only drains the queue (and keeps draining while work is left).
+    /// </summary>
+    private async Task DrainQueueAsync(string reason, CancellationToken ct)
+    {
+        // §11: the user sees "Syncing" while our own work runs - but only for as long as it runs.
+        _draining = true;
+        ApplyUserStatus(reason);
+        var result = await _queueDrainer.DrainAsync(async token =>
+        {
+            var mappings = await _mappingStore.GetMappingsAsync(token);
+            _mappings = mappings;
+            if (_transfer is not null) await _transfer.ProcessAsync(mappings, token);
+            await UpdateMappingStatusesAsync(mappings, token);
+            var summary = await RefreshCountersAsync();
+            return new QueueDrainResult(summary.WaitingCount, _transfer?.ActiveTransfers ?? 0, false);
+        }, ct);
+        _draining = false;
+        DiagnosticsLogger.Write("QUEUE_DRAIN", $"reason={reason} passes={_queueDrainer.Passes} pending={result.PendingOperations} active={result.ActiveTransfers}");
+        ApplyUserStatus(reason);
+    }
+
+    /// <summary>Mapping rows follow the live queue depth (unchanged behaviour, shared by both cadences).</summary>
+    private async Task UpdateMappingStatusesAsync(IReadOnlyList<SyncMapping> mappings, CancellationToken ct)
+    {
+        foreach (var mapping in mappings.Where(x => x.Enabled && x.ServerRootId is not null))
+        {
+            var pending = await _mappingStore.PendingCountAsync(mapping.MappingId, ct);
+            var current = await _mappingStore.GetMappingAsync(mapping.MappingId, ct);
+            if (current is not null && current.Status is not MappingStatus.Paused and not MappingStatus.ReadyForPreflight and not MappingStatus.ReadyToSync and not MappingStatus.Stopped)
+                await _mappingStore.UpdateMappingAsync(current with { Status = pending == 0 ? MappingStatus.UpToDate : MappingStatus.Syncing, LastError = null, UpdatedAt = DateTimeOffset.UtcNow }, ct);
+        }
+        _mappings = mappings;
+    }
+
+    /// <summary>
+    /// §3/§4/§7: the user-visible status is derived from the live queue/connection/error state — never from
+    /// the fact that a background cycle is running.
+    /// </summary>
+    private void ApplyUserStatus(string reason)
+    {
+        if (_lastSummary is null) return;
+        var mappings = _mappings;
+        _statusPresenter.Apply(new SyncStatusInput(
+            _lastConnectionState ?? ConnectionState.Connecting,
+            _lastSummary.WaitingCount,
+            _transfer?.ActiveTransfers ?? 0,
+            // A remote change only becomes visible work when it queued something to transfer; the queue
+            // itself is the signal (pending/active/work-in-progress), so no separate "changes arrived" hint.
+            RemoteChangesApplied: false,
+            _lastSummary.ErrorCount,
+            HasMappings: mappings.Count > 0,
+            AllMappingsStopped: mappings.Count > 0 && mappings.All(x => !x.Enabled),
+            Paused: _paused,
+            WorkInProgress: _draining), reason);
+    }
+
+    /// <summary>§6: fires only on a real visible change, so the subtitle does not flicker and stays a no-op otherwise.</summary>
+    private void OnUserStatusChanged(SyncUserStatus status, string text, string reason)
+    {
+        DiagnosticsLogger.Write("STATUS_VISIBLE", $"old_visible=\"{_lastVisibleStatus}\" new_visible=\"{text}\" state={status} reason={reason}");
+        _lastVisibleStatus = text;
+        Dispatcher.BeginInvoke(() =>
+        {
+            if (!string.Equals(StatusText.Text, text, StringComparison.Ordinal)) StatusText.Text = text;
+            if (!string.Equals(_activityVm.Status, text, StringComparison.Ordinal)) _activityVm.Status = text;
+            UpdateTrayStatus();
+        });
+    }
+
+    /// <summary>
+    /// §8: a user action, a reconnect or a changed destination must not wait out the idle minute. The pulse
+    /// also unblocks a loop that is already sleeping on the 60 s interval.
+    /// </summary>
+    private void WakeForImmediateRefresh(string reason)
+    {
+        _pollSchedule.RequestImmediate(reason);
+        _wake.Pulse();
+    }
+
     private int BackoffMs() => Math.Min(60000, (int)(2000 * Math.Pow(2, Math.Min(_failures, 5))));
     private static async Task Delay(int ms, CancellationToken ct) { try { await Task.Delay(ms, ct); } catch (OperationCanceledException) { } }
+    private static Task Delay(TimeSpan delay, CancellationToken ct) => Delay((int)delay.TotalMilliseconds, ct);
 
     private void PopulateRoots(IReadOnlyList<SyncRootDto> roots)
     {
@@ -325,13 +451,10 @@ public partial class MainWindow : Window
             _foldersVm.Stats = $"{summary.IndexedFiles:N0} indexed · {summary.WaitingCount:N0} waiting · {summary.ErrorCount:N0} errors";
             _settingsVm.QueueLength = summary.WaitingCount.ToString("N0");
             SidebarSyncText.Text = summary.WaitingCount == 0 ? "Everything is up to date" : $"{summary.WaitingCount:N0} changes waiting safely";
-            StatusText.Text = summary.ErrorCount > 0
-                ? "Sync issues need attention"
-                : summary.WaitingCount > 0
-                    ? "Changes waiting safely"
-                    : "Up to date";
-            UpdateTrayStatus();
         });
+        // §1/§5: the subtitle is owned by the status presenter (one writer, stable while idle).
+        _lastSummary = summary;
+        ApplyUserStatus("counters");
         return summary;
     }
 
@@ -410,7 +533,6 @@ public partial class MainWindow : Window
             ConnectionState.AuthenticationExpired => "Authorization expired",
             ConnectionState.ProtocolError or ConnectionState.ServerError => "Server error",
             ConnectionState.ServerUnavailable => "Server unavailable",
-            ConnectionState.Checking => "Checking...",
             _ => "Disconnected"
         };
         var visual = $"{label}|{message}";
@@ -423,30 +545,15 @@ public partial class MainWindow : Window
             SidebarStatus.Foreground = tone == "Success" ? System.Windows.Media.Brushes.LightGreen : tone == "Warning" ? System.Windows.Media.Brushes.Gold : System.Windows.Media.Brushes.Salmon;
             _settingsVm.ConnectionStatus = message;
             _settingsVm.ConnectionTone = tone;
-            _activityVm.Status = label;
+            // §2/§5: the primary status line is written by SyncUserStatusPresenter only - the connection
+            // detail stays in the muted line under it.
             _activityVm.ConnectionMessage = message;
             _activityVm.ConnectionTone = tone;
             UpdateTrayStatus();
         });
-        if (state is ConnectionState.ServerUnavailable or ConnectionState.Reconnecting)
-            SetSyncStatus(EngineState.Offline, "Offline - local changes are safe");
-    }
-
-    private void SetSyncStatus(EngineState state, string message)
-    {
-        var label = state switch
-        {
-            EngineState.OnlineIdle or EngineState.UpToDate => message,
-            EngineState.InitialInventory or EngineState.Reconciling => "Updating metadata...",
-            EngineState.SyncingMetadata or EngineState.Syncing => message,
-            EngineState.Paused => "Sync paused",
-            EngineState.AuthenticationRequired => "Waiting for authorization",
-            EngineState.Offline => "Offline - local changes are safe",
-            _ => message
-        };
-        if (label == _lastSyncVisual) return;
-        _lastSyncVisual = label;
-        Dispatcher.BeginInvoke(() => { StatusText.Text = label; });
+        // §3/§4: offline/reconnecting reaches the user through the presenter (connection state is its input),
+        // so no status string is written from here.
+        if (state is ConnectionState.ServerUnavailable or ConnectionState.Reconnecting or ConnectionState.Disconnected or ConnectionState.AuthenticationExpired) ApplyUserStatus("connection");
     }
 
     private void ApplyMappingProgress(SyncMapping mapping, ScanProgress progress)
@@ -618,6 +725,7 @@ public partial class MainWindow : Window
         // Now start: persists desired state (enabled=true) and begins transfers (§2).
         await _mappingRuntime.StartSyncAsync(current);
         AddActivity($"Sync started for {current.LocalPath}: transfers beginning.");
+        WakeForImmediateRefresh("user-start");
         await RefreshMappingsAsync();
     }
 
@@ -635,6 +743,7 @@ public partial class MainWindow : Window
         foreach (var mapping in _mappings.Where(x => x.ServerRootId is not null))
             await StartMappingAsync(mapping);
         _activityVm.SyncRunning = true;
+        WakeForImmediateRefresh("user-start");
     }
 
     private async Task GlobalStopSync()
@@ -660,6 +769,7 @@ public partial class MainWindow : Window
         await _mappingStore.UpdateMappingAsync(updated);
         await RefreshMappingsAsync();
         AddActivity($"NAS destination changed to {root.Name} / {dialog.DestinationRelativePath}");
+        WakeForImmediateRefresh("destination-changed");
     }
 
     private async void RemoveMapping(SyncMapping mapping)
@@ -722,6 +832,7 @@ public partial class MainWindow : Window
         await RefreshMappingsAsync();
         await _mappingRuntime.StartAsync(mapping);
         AddActivity($"Folder added - scan started in background: {mapping.LocalPath}");
+        WakeForImmediateRefresh("folder-added");
     }
 
     private async Task ConnectAsync(string serverUrl, string token)
@@ -805,6 +916,8 @@ public partial class MainWindow : Window
         _remoteCts?.Dispose();
         _remoteCts = new CancellationTokenSource();
         _failures = 0;
+        // §8: a fresh loop (startup, connect, resume) always polls the server immediately.
+        _pollSchedule.RequestImmediate("loop-restart");
         _ = RemoteLoopAsync(_remoteCts.Token);
     }
 
@@ -812,7 +925,7 @@ public partial class MainWindow : Window
     {
         _paused = !_paused;
         _activityVm.SyncRunning = !_paused;
-        SetSyncStatus(_paused ? EngineState.Paused : EngineState.Connecting, _paused ? "Sync paused" : "Resuming...");
+        ApplyUserStatus(_paused ? "paused" : "resumed");
         UpdateTrayStatus();
         if (_paused) _remoteCts?.Cancel();
         else RestartRemoteLoop();
@@ -867,9 +980,8 @@ public partial class MainWindow : Window
         if (_tray is null) return;
         var status = _paused ? "Paused" : _connectionTracker.State switch
         {
-            ConnectionState.Connected when _activityVm.ErrorsText != "0" => "Errors",
-            ConnectionState.Connected when _activityVm.WaitingText != "0" => "Syncing",
-            ConnectionState.Connected => "Up to date",
+            // §2/§6: the tray mirrors the single user-visible status instead of inventing its own.
+            ConnectionState.Connected => string.IsNullOrEmpty(_lastVisibleStatus) ? "Up to date" : _lastVisibleStatus,
             ConnectionState.AuthenticationRequired or ConnectionState.AuthenticationExpired or ConnectionState.ServerUnavailable => "Disconnected",
             _ => "Connecting"
         };

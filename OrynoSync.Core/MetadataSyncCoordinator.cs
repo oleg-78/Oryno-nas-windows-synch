@@ -1,6 +1,6 @@
 namespace OrynoSync.Core;
 
-public sealed record MetadataProgress(EngineState State,string Message,int Processed=0,long Revision=0);
+public sealed record MetadataProgress(EngineState State,string Message,int Processed=0,long Revision=0,int Changes=0);
 public sealed class MetadataSyncCoordinator(ISyncMetadataApi api,IRemoteStateStore store)
 {
     private readonly SemaphoreSlim _requestGate=new(1,1);public event Action<MetadataProgress>? Progress;
@@ -20,7 +20,7 @@ public sealed class MetadataSyncCoordinator(ISyncMetadataApi api,IRemoteStateSto
     }
     private async Task PullChangesAsync(Guid rootId,long after,CancellationToken ct)
     {
-        var more=true;while(more){Progress?.Invoke(new(EngineState.SyncingMetadata,"Checking server changes",Revision:after));var page=await Request(()=>api.GetChangesPageAsync(rootId,after,500,ct),ct);var next=page.NextRevision??after;if(next<after)throw new SyncApiException(System.Net.HttpStatusCode.OK,"REVISION_REGRESSION","Server revision cursor moved backwards.");await store.ApplyChangesPageAsync(rootId,page.Changes,next,ct);after=next;more=page.HasMore;}
+        var more=true;while(more){Progress?.Invoke(new(EngineState.SyncingMetadata,"Checking server changes",Revision:after));var page=await Request(()=>api.GetChangesPageAsync(rootId,after,500,ct),ct);var next=page.NextRevision??after;if(next<after)throw new SyncApiException(System.Net.HttpStatusCode.OK,"REVISION_REGRESSION","Server revision cursor moved backwards.");await store.ApplyChangesPageAsync(rootId,page.Changes,next,ct);if(page.Changes.Count>0)Progress?.Invoke(new(EngineState.SyncingMetadata,$"Applied {page.Changes.Count} server change(s)",Revision:next,Changes:page.Changes.Count));after=next;more=page.HasMore;}
     }
     private async Task<T> Request<T>(Func<Task<T>> action,CancellationToken ct){await _requestGate.WaitAsync(ct);try{return await action();}finally{_requestGate.Release();}}
 }

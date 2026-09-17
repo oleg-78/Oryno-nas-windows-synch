@@ -9,6 +9,14 @@ public sealed class SyncMappingRuntimeManager(ISyncMappingStore store) : IDispos
     public IReadOnlyCollection<Guid> ActiveMappings => _runtimes.Keys.ToArray();
 
     /// <summary>
+    /// §9/§13: shared with the app loop. A local change pulses the wake signal so the queue is drained at
+    /// once instead of waiting for the next remote poll, and files that the client itself materialised are
+    /// registered in the suppression set so the watcher does not upload them straight back.
+    /// </summary>
+    public SyncWakeSignal? Wake { get; set; }
+    public LocalMutationSuppression? Suppression { get; set; }
+
+    /// <summary>
     /// §2/§13/§15: the persisted desired state decides what happens after a restart.
     /// Enabled=true → continuous sync resumes without any click; Enabled=false → it stays Stopped.
     /// </summary>
@@ -58,7 +66,9 @@ public sealed class SyncMappingRuntimeManager(ISyncMappingStore store) : IDispos
             mapping,
             store,
             text => Activity?.Invoke(mapping, text),
-            progress => Progress?.Invoke(mapping, progress));
+            progress => Progress?.Invoke(mapping, progress),
+            Wake,
+            Suppression);
         _runtimes[mapping.MappingId] = runtime;
         if (mapping.Status is not MappingStatus.ReadyForPreflight and not MappingStatus.ReadyToSync and not MappingStatus.Stopped)
             await SetStatusAsync(mapping, MappingStatus.Scanning, null, ct);
@@ -107,6 +117,15 @@ public sealed class SyncMappingRuntimeManager(ISyncMappingStore store) : IDispos
         if (!paused && _runtimes.TryGetValue(mapping.MappingId, out runtime)) runtime.StartScan();
     }
 
+    /// <summary>
+    /// §15: ask every running mapping for a full reconciliation again (used after a watcher buffer overflow
+    /// and by the UI). The per-mapping scan gate coalesces a burst of requests into one running scan.
+    /// </summary>
+    public void RequestRescan(string reason = "request")
+    {
+        foreach (var runtime in _runtimes.Values) runtime.StartScan(reason);
+    }
+
     public void Stop(Guid mappingId)
     {
         if (_runtimes.Remove(mappingId, out var runtime)) runtime.Dispose();
@@ -137,16 +156,23 @@ public sealed class SyncMappingRuntimeManager(ISyncMappingStore store) : IDispos
         private readonly SemaphoreSlim _scanGate = new(1, 1);
         private readonly List<MappingLocalItem> _batchItems = new(100);
         private readonly List<MappingPendingOperation> _batchOperations = new(100);
+        private readonly SyncWakeSignal? _wake;
+        private readonly LocalMutationSuppression? _suppression;
+        private readonly IgnoreRules _ignores = new();
+        private string _scanReason = "request";
         private bool _disposed;
 
         public bool Paused { get; set; }
 
-        public Runtime(SyncMapping mapping, ISyncMappingStore store, Action<string> activity, Action<ScanProgress> progress)
+        public Runtime(SyncMapping mapping, ISyncMappingStore store, Action<string> activity, Action<ScanProgress> progress,
+            SyncWakeSignal? wake = null, LocalMutationSuppression? suppression = null)
         {
             _mapping = mapping;
             _store = store;
             _activity = activity;
             _progress = progress;
+            _wake = wake;
+            _suppression = suppression;
             _watcher = new FileSystemWatcher(mapping.LocalPath)
             {
                 IncludeSubdirectories = true,
@@ -163,12 +189,13 @@ public sealed class SyncMappingRuntimeManager(ISyncMappingStore store) : IDispos
         public void Start()
         {
             _watcher.EnableRaisingEvents = true;
-            StartScan();
+            StartScan("start");
         }
 
-        public void StartScan()
+        public void StartScan(string reason = "request")
         {
             if (_disposed) return;
+            _scanReason = reason;
             _ = Task.Run(() => ScanAsync(_lifetime.Token), CancellationToken.None);
         }
 
@@ -177,6 +204,9 @@ public sealed class SyncMappingRuntimeManager(ISyncMappingStore store) : IDispos
             if (!await _scanGate.WaitAsync(0, ct)) return;
             try
             {
+                // §4/§15: a full scan is the rare fallback (start / watcher overflow), never the answer to a
+                // single file change. Logged so the load test can prove that a 20-file burst caused zero scans.
+                SyncDiagnostics.Report("FULL_SCAN", $"mapping={_mapping.MappingId} reason={_scanReason} path={_mapping.LocalPath}");
                 if (!Directory.Exists(_mapping.LocalPath))
                 {
                     await UpdateStatusAsync(MappingStatus.LocalFolderUnavailable, "Local folder unavailable", ct);
@@ -186,7 +216,7 @@ public sealed class SyncMappingRuntimeManager(ISyncMappingStore store) : IDispos
                 var oldItems = (await _store.GetItemsAsync(_mapping.MappingId, ct))
                     .ToDictionary(x => x.RelativePath, StringComparer.OrdinalIgnoreCase);
                 var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                var ignores = new IgnoreRules();
+                var ignores = _ignores;
                 var files = 0;
                 var folders = 0;
                 var changes = 0;
@@ -293,9 +323,11 @@ public sealed class SyncMappingRuntimeManager(ISyncMappingStore store) : IDispos
         private async Task FlushBatchAsync()
         {
             if (_batchItems.Count == 0 && _batchOperations.Count == 0) return;
+            var queued = _batchOperations.Count;
             await _store.IndexBatchAsync(_batchItems, _batchOperations, _lifetime.Token);
             _batchItems.Clear();
             _batchOperations.Clear();
+            if (queued > 0) _wake?.Pulse(); // §9: the scan produced work - drain it now
         }
 
         private void On(object? sender, FileSystemEventArgs e)
@@ -312,19 +344,71 @@ public sealed class SyncMappingRuntimeManager(ISyncMappingStore store) : IDispos
         {
             if (e.GetException() is InternalBufferOverflowException)
             {
+                // §15: events were lost, so one full reconciliation is the only honest recovery.
                 _activity("Watcher overflow; rescanning folder");
-                StartScan();
+                StartScan("overflow");
             }
         }
 
         private void Schedule(WatcherChangeTypes type, string path, string? oldPath)
         {
             var rel = PathRules.ToRelative(_mapping.LocalPath, path);
-            if (new IgnoreRules().IsIgnored(rel)) return;
+            if (_ignores.IsIgnored(rel)) return;
+            // §13: the file this client just downloaded raises Created/Changed as well. Without this check
+            // the watcher would queue an upload of the server's own content straight back (feedback loop).
+            if (_suppression is not null)
+            {
+                var created = File.Exists(path) ? new FileInfo(path) : null;
+                if (_suppression.IsSuppressed(rel, created) || _suppression.IsMaterialisedRecently(rel))
+                {
+                    SyncDiagnostics.Report("FEEDBACK_SUPPRESSED", $"mapping={_mapping.MappingId} path={rel} exact={created is not null}");
+                    return;
+                }
+            }
             if (_debounce.Remove(rel, out var old)) old.Cancel();
             var cts = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
             _debounce[rel] = cts;
             _ = ApplyAsync(type, rel, oldPath, cts.Token);
+        }
+
+        /// <summary>
+        /// §3: Word/Excel keep the file locked for a moment after the last write. Wait until size and mtime
+        /// stop moving and the file can be read, so a half-saved document is never queued for upload.
+        /// </summary>
+        private static async Task<bool> WaitForStableFileAsync(string full, CancellationToken ct)
+        {
+            for (var attempt = 0; attempt < 6; attempt++)
+            {
+                if (!File.Exists(full)) return true;
+                var info = new FileInfo(full);
+                var size = info.Length;
+                var mtime = info.LastWriteTimeUtc;
+                await Task.Delay(250, ct);
+                info.Refresh();
+                if (!info.Exists) return true;
+                if (info.Length != size || info.LastWriteTimeUtc != mtime) continue;
+                try
+                {
+                    using var probe = new FileStream(full, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                    return true;
+                }
+                catch (IOException) { }
+                catch (UnauthorizedAccessException) { }
+            }
+            return false;
+        }
+
+        private void RescheduleLater(WatcherChangeTypes type, string rel, string? oldPath, int delayMs = 1000)
+        {
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await Task.Delay(delayMs, _lifetime.Token);
+                    Schedule(type, PathRules.ToAbsolute(_mapping.LocalPath, rel), oldPath);
+                }
+                catch (OperationCanceledException) { }
+            });
         }
 
         /// <summary>§1/§3: persist a local delete intent (tombstone) so the sync loop propagates DELETE
@@ -349,7 +433,7 @@ public sealed class SyncMappingRuntimeManager(ISyncMappingStore store) : IDispos
                 // §1: a local delete intent must be durable BEFORE the debounce window, otherwise a
                 // remote-only pass that is already running can re-download the file we just deleted
                 // (observed: proof file came back with the server's mtime).
-                if (type == WatcherChangeTypes.Deleted && !new IgnoreRules().IsIgnored(rel))
+                if (type == WatcherChangeTypes.Deleted && !_ignores.IsIgnored(rel))
                     await MarkDeleteIntentAsync(rel, ct);
                 await Task.Delay(750, ct);
                 _debounce.Remove(rel);
@@ -368,6 +452,13 @@ public sealed class SyncMappingRuntimeManager(ISyncMappingStore store) : IDispos
                 else
                 {
                     var isDirectory = Directory.Exists(full);
+                    if (!isDirectory && !await WaitForStableFileAsync(full, ct))
+                    {
+                        // §3: still locked after ~1.5 s of quiet — retry shortly instead of failing the upload.
+                        _activity($"Still being written; will retry: {rel}");
+                        RescheduleLater(type, rel, oldPath);
+                        return;
+                    }
                     var info = isDirectory ? null : new FileInfo(full);
                     await _store.UpsertItemAsync(new(_mapping.MappingId, rel,
                         isDirectory ? ItemType.Directory : ItemType.File,
@@ -385,6 +476,8 @@ public sealed class SyncMappingRuntimeManager(ISyncMappingStore store) : IDispos
         {
             await _store.EnqueueAsync(new(Guid.NewGuid(), _mapping.MappingId, type, rel, second,
                 DateTimeOffset.UtcNow, 0, DateTimeOffset.UtcNow, OperationState.Pending, null), ct);
+            // §9: a local change woke the watcher - the scheduler must not wait for the next remote poll.
+            _wake?.Pulse();
         }
 
         public void Dispose()

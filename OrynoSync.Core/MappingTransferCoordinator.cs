@@ -87,6 +87,26 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
 
     public int ActiveTransfers => _scheduler.ActiveCount;
 
+    /// <summary>
+    /// §9/§10/§13: shared with the app loop and the mapping watcher. <see cref="Wake"/> is pulsed when this
+    /// coordinator queues real work; <see cref="Suppression"/> remembers files it just materialised so the
+    /// filesystem watcher does not upload the server's own content back.
+    /// </summary>
+    public SyncWakeSignal? Wake { get; set; }
+    public LocalMutationSuppression? Suppression { get; set; }
+
+    /// <summary>§13: record a freshly written download (path + expected size/mtime) in the suppression set.</summary>
+    private void RegisterMaterialized(SyncMapping mapping, string relativePath, string fullPath)
+    {
+        try
+        {
+            var info = new FileInfo(fullPath);
+            if (info.Exists) Suppression?.Expect(relativePath, info.Length, info.LastWriteTimeUtc);
+        }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
+    }
+
     public async Task RemoveMappingAsync(SyncMapping mapping, CancellationToken ct = default)
     {
         await mappings.RemoveMappingAsync(mapping.MappingId, ct);
@@ -288,6 +308,8 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
                 null, DateTimeOffset.UtcNow, 0, DateTimeOffset.UtcNow, OperationState.Pending, null);
             await mappings.EnqueueAsync(deleteOp, ct);
             pendingList.Add(deleteOp);
+            // §5/§9: a local delete propagates now, not at the next remote poll.
+            Wake?.Pulse();
             LogDiagnosticDeduped("LOCAL_DELETE_INTENT", mapping.MappingId, rel, "queued DELETE for NAS");
         }
         pending = pendingList.ToArray();
@@ -486,12 +508,15 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
                 if (existing is null || existing.ContentHash is null) throw new SyncApiException(System.Net.HttpStatusCode.NotFound, "SYNC_CONTENT_MISSING", "Remote content metadata is unavailable.");
                 var currentItem = await api.GetItemAsync(existing.ItemId, ct);
                 var downloadPath = PathRules.ToAbsolute(mapping.LocalPath, rel); Directory.CreateDirectory(Path.GetDirectoryName(downloadPath)!);
+                // §13: claim the path BEFORE the file exists, otherwise the watcher can echo the write back as an upload.
+                Suppression?.Expect(rel, currentItem.SizeBytes ?? 0, currentItem.MtimeUtc ?? DateTimeOffset.UtcNow);
                 // Section I fix: Acquire transport slot for concurrent download
                 using (await _scheduler.AcquireAsync(ct))
                 {
                     await _transfers.DownloadAsync(new DownloadTarget(currentItem.ItemId, currentItem.Version, rel, currentItem.SizeBytes ?? 0, currentItem.ContentHash ?? existing.ContentHash, currentItem.MtimeUtc), downloadPath, ct);
                 }
                 var downloaded = new FileInfo(downloadPath); await mappings.UpsertItemAsync(new(mapping.MappingId, rel, ItemType.File, downloaded.Length, downloaded.LastWriteTimeUtc, SyncItemState.Synced), ct); 
+                RegisterMaterialized(mapping, rel, downloadPath);
                 await RecordAsync(mapping, rel, "Downloaded", "Synced", null, ct);
                 // Section 9 fix: Update last successful file sync on download too
                 await UpdateLastSuccessfulFileSync(mapping);
@@ -823,7 +848,8 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
         }
 
         var pendingPaths = (await mappings.GetPendingAsync(mapping.MappingId, DateTimeOffset.MaxValue, ct)).Select(x => PathRules.NormalizeRelative(x.RelativePath)).ToHashSet(StringComparer.OrdinalIgnoreCase);
-        foreach (var item in remote.Values.OrderBy(x => x.RelativePath.Count(c => c == '\\')).OrderBy(x => x.RelativePath.Count(c => c == '/')))
+        // A remote row without a path cannot be materialized (and used to crash the depth ordering below).
+        foreach (var item in remote.Values.Where(x => !string.IsNullOrEmpty(x.RelativePath)).OrderBy(x => x.RelativePath.Count(c => c == '\\')).OrderBy(x => x.RelativePath.Count(c => c == '/')))
         {
             if (!mapping.InDestination(item.RelativePath)) continue;
             var localRel = mapping.ToLocalRel(item.RelativePath);
@@ -873,12 +899,15 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
             catch (SyncApiException e) when (e.Code == "SYNC_ITEM_NOT_FOUND") { await remoteState.MarkItemMissingAsync(rootId, item.ItemId.ToString(), ct); await RecordAsync(mapping, localRel, "Download", "Error", e.Message, ct); continue; }
             try
             {
+                // §13: claim the path BEFORE the file exists, otherwise the watcher can echo this write back as an upload.
+                Suppression?.Expect(localRel, current.SizeBytes ?? 0, current.MtimeUtc ?? DateTimeOffset.UtcNow);
                 // Section I fix: Acquire transport slot for concurrent download
                 using (await _scheduler.AcquireAsync(ct))
                 {
                     await _transfers.DownloadAsync(new DownloadTarget(current.ItemId, current.Version, localRel, current.SizeBytes ?? 0, current.ContentHash ?? item.ContentHash!, current.MtimeUtc), full, ct);
                 }
                 var info = new FileInfo(full); await mappings.UpsertItemAsync(new(mapping.MappingId, localRel, ItemType.File, info.Length, info.LastWriteTimeUtc, SyncItemState.Synced), ct);
+                RegisterMaterialized(mapping, localRel, full);
                 await RecordAsync(mapping, localRel, "Downloaded", "Synced", null, ct);
             }
             catch (SyncApiException e) when (e.Code == "SYNC_CONTENT_MISSING")
