@@ -50,9 +50,22 @@ public sealed class ResumableTransferClient(IContentTransferApi api, string temp
                 try
                 {
                     var existing = await api.GetUploadStatusAsync(savedId, ct);
-                    session = new(existing.UploadId, existing.State, 8, existing.ReceivedBytes, existing.ExpectedSize, existing.ExpiresAt);
+                    // §19 (recursive audit): a session the server already expired/aborted/failed can never be
+                    // resumed — its staging data is gone, so the client sent no bytes and the commit answered
+                    // 409/500 forever. Observed in production: 6 files kept retrying poisoned sessions created
+                    // on 2026-09-07 (state=FAILED, staging already reaped). Start a fresh session instead.
+                    if (existing.State is "EXPIRED" or "ABORTED" or "FAILED")
+                    {
+                        if (_sessions is not null) await _sessions.RemoveAsync(key, ct);
+                        session = await CreateAsync();
+                    }
+                    else session = new(existing.UploadId, existing.State, 8, existing.ReceivedBytes, existing.ExpectedSize, existing.ExpiresAt);
                 }
-                catch (SyncApiException e) when (e.Code == "SYNC_UPLOAD_NOT_FOUND") { session = await CreateAsync(); }
+                catch (SyncApiException e) when (e.Code == "SYNC_UPLOAD_NOT_FOUND")
+                {
+                    if (_sessions is not null) await _sessions.RemoveAsync(key, ct);
+                    session = await CreateAsync();
+                }
             }
             else session = await CreateAsync();
             if (_sessions is not null) await _sessions.SaveAsync(key, session.UploadId, before.Length, expectedHash, target.MappingId, ct);
@@ -79,7 +92,7 @@ public sealed class ResumableTransferClient(IContentTransferApi api, string temp
                 }
                 offset += read;
             }
-            var commit = await api.CommitUploadAsync(session.UploadId, target.OperationId, expectedHash, ct);
+            var commit = await CommitWithSessionResetAsync(session.UploadId, target, expectedHash, key, ct);
             if (_sessions is not null) await _sessions.RemoveAsync(key, ct);
             var after = new FileInfo(path);
             if (after.Length != before.Length || after.LastWriteTimeUtc != before.LastWriteTimeUtc) throw new FileChangedDuringTransferException(path);
@@ -88,6 +101,21 @@ public sealed class ResumableTransferClient(IContentTransferApi api, string temp
             Task<UploadCreateResponse> CreateAsync() => api.CreateUploadAsync(new UploadCreateRequest(target.RootId, target.ParentItemId, target.ItemId is null ? target.Name : null, target.ItemId, target.BaseVersion, before.Length, target.OperationId), ct);
         }
         finally { _active.Release(); }
+    }
+
+    /// <summary>
+    /// §19 (recursive audit): a commit that fails because the server no longer has the session's staging data
+    /// must also drop the saved session, otherwise every retry resumes the same dead upload id and the file
+    /// can never reach the NAS (observed: 6 files looping forever with `upload EXPIRED` / 500).
+    /// </summary>
+    private async Task<TransferCommit> CommitWithSessionResetAsync(Guid uploadId, UploadTarget target, string expectedHash, string key, CancellationToken ct)
+    {
+        try { return await api.CommitUploadAsync(uploadId, target.OperationId, expectedHash, ct); }
+        catch (SyncApiException e) when (e.Code is "SYNC_UPLOAD_STALE" or "SYNC_UPLOAD_STATE" or "SYNC_UPLOAD_INCOMPLETE")
+        {
+            if (_sessions is not null) await _sessions.RemoveAsync(key, ct);
+            throw;
+        }
     }
 
     public async Task<TransferResult> DownloadAsync(DownloadTarget target, string destinationPath, CancellationToken ct = default)
