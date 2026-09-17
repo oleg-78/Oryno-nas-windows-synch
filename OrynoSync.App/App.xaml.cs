@@ -15,12 +15,29 @@ public partial class App : Application
     public static bool CleanupSampleMappings { get; private set; }
     public static readonly EventWaitHandle ActivateEvent = new(false, EventResetMode.AutoReset, "Local\\OrynoSync.Activate");
     private Mutex? _mutex;
+    private FileStream? _instanceLock;
     internal static bool StartedFromAutostart { get; private set; }
     protected override void OnStartup(StartupEventArgs e)
     {
         StartedFromAutostart = e.Args.Any(x => x.Equals("--autostart", StringComparison.OrdinalIgnoreCase));
         DiagnosticsLogger.Write(StartedFromAutostart ? "AUTOSTART_LAUNCH" : "APP_LAUNCH", $"executable={Environment.ProcessPath ?? "unknown"} args={string.Join(" ", e.Args)}");
         _mutex = new Mutex(true, "Local\\OrynoSync.SingleInstance", out var first);
+        // §8: the "Local\" mutex is scoped to ONE Windows session, so a second engine could still start
+        // from another session (console + RDP, or a script). A per-user lock file is session-independent.
+        try
+        {
+            var lockDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "OrynoSync");
+            Directory.CreateDirectory(lockDir);
+            _instanceLock = new FileStream(Path.Combine(lockDir, "oryno-sync.instance.lock"), FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+        }
+        catch (IOException)
+        {
+            first = false; // another instance already holds the lock
+        }
+        catch (Exception ex)
+        {
+            DiagnosticsLogger.Write("SINGLE_INSTANCE_LOCK_FAILED", ex.Message); // never block startup on a lock quirk
+        }
         if (!first) { try { using var signal = EventWaitHandle.OpenExisting("Local\\OrynoSync.Activate"); signal.Set(); } catch { } Shutdown(); return; }
         base.OnStartup(e); MainWindow = new MainWindow();
         SampleMappings = e.Args.Any(x => x.Equals("--sample-mappings", StringComparison.OrdinalIgnoreCase));

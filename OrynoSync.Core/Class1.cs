@@ -1,7 +1,7 @@
 namespace OrynoSync.Core;
 
 public enum ItemType { File, Directory }
-public enum SyncItemState { Synced, Waiting, Uploading, Downloading, Conflict, Error, Ignored }
+public enum SyncItemState { Synced, Waiting, Uploading, Downloading, Conflict, Error, Ignored, DeletedLocal }
 public enum OperationType { CreateFile, UpdateFile, CreateDirectory, Move, Delete, DownloadFile, DownloadDirectory, Conflict }
 public enum OperationState { Pending, InProgress, Retrying, Completed, Failed, FailedPermanent, BlockedWaitingForServerCapability, Cancelled, Resolved, Archived }
 /// <summary>Lifecycle of a queue entry as the UI must present it:

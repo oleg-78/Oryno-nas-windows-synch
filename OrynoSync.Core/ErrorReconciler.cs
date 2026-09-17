@@ -56,7 +56,10 @@ public sealed record ErrorReconcileReport(
 public static class ErrorReconciler
 {
     private static readonly string[] TransientMarkers =
-        ["timeout", "timed out", "temporarily", "503", "502", "504", "internal server error", "connection", "network", "closed unexpectedly", "try again"];
+        ["timeout", "timed out", "temporarily", "503", "502", "504", "internal server error", "connection", "network", "closed unexpectedly", "try again",
+         // Local storage/bookkeeping failures (SQLite schema/db errors) are never a content conflict:
+         // they are infrastructure faults and must be retried, not shown as "needs your decision".
+         "sqlite", "no such column", "no such table", "database is locked", "database disk image is malformed"];
 
     private static readonly string[] NameExistsMarkers = ["name exists", "already exists", "name already exists", "409", "name_conflict"];
 

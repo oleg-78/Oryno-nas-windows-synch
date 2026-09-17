@@ -51,7 +51,66 @@ public class CoreTests
     private static SyncMapping NewMapping(string path)=>new(Guid.NewGuid(),path,null,null,true,DateTimeOffset.UtcNow,DateTimeOffset.UtcNow,null,"NotStarted",null,null,MappingStatus.Offline);
     private static SyncMapping NewMappingWithDest(string path)=>new(Guid.NewGuid(),path,null,null,true,DateTimeOffset.UtcNow,DateTimeOffset.UtcNow,null,"NotStarted",null,null,MappingStatus.ReadyToSync,Guid.NewGuid(),"Dest");
     private static HttpResponseMessage Response(HttpStatusCode status,string body){return new HttpResponseMessage(status){Content=new StringContent(body,Encoding.UTF8,"application/json")};}
+    [Fact] public void LocalDeleteIntentPlansDeleteNotDownload(){var root=Guid.NewGuid();var mid=Guid.NewGuid();var server=new[]{new RemoteItemState(Guid.NewGuid(),root,null,"gone.txt","gone.txt","file",5,DateTimeOffset.UtcNow,"abc",1,1,RemotePlanningState.MetadataOnly)};var tracked=new Dictionary<string,MappingLocalItem>(StringComparer.OrdinalIgnoreCase){["gone.txt"]=new(mid,"gone.txt",ItemType.File,5,DateTimeOffset.UtcNow,SyncItemState.DeletedLocal)};var r=QueueNormalizer.Plan([],server,[],tracked);Assert.Contains(r.Operations,x=>x.RelativePath=="gone.txt"&&x.Type==OperationType.Delete);Assert.DoesNotContain(r.Operations,x=>x.Type==OperationType.DownloadFile);}
+    [Fact] public void WithoutDeleteIntentRemoteOnlyIsDownloaded(){var root=Guid.NewGuid();var server=new[]{new RemoteItemState(Guid.NewGuid(),root,null,"fresh.txt","fresh.txt","file",5,DateTimeOffset.UtcNow,"abc",1,1,RemotePlanningState.MetadataOnly)};var r=QueueNormalizer.Plan([],server,[]);Assert.Contains(r.Operations,x=>x.RelativePath=="fresh.txt"&&x.Type==OperationType.DownloadFile);}
+
     private static RemoteItemDto Item(string name)=>new(Guid.NewGuid(),null,name,name,"file",4,DateTimeOffset.UtcNow,null,1);
     private sealed class RecordingHandler(Func<HttpRequestMessage,HttpResponseMessage> response):HttpMessageHandler{public string? Authorization;public string? Path;protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request,CancellationToken ct){Authorization=request.Headers.Authorization?.ToString();Path=request.RequestUri?.AbsolutePath;var r=response(request);r.RequestMessage=request;return Task.FromResult(r);}}
+    // §4 regression: сервер без HEAD отвечал 405 → клиент не получал авторитетный хэш,
+    // объявлял ложный конфликт и плодил conflict-копии. Проверяем fallback на ranged GET.
+    [Fact] public async Task ContentMetadataFallsBackToRangeGetWhenHeadUnsupported()
+    {
+        var headCalls=0; var getCalls=0;
+        var handler=new RecordingHandler(req=>
+        {
+            if(req.Method==HttpMethod.Head){headCalls++;return new HttpResponseMessage(HttpStatusCode.MethodNotAllowed);}
+            getCalls++;
+            var r=new HttpResponseMessage(HttpStatusCode.PartialContent){Content=new ByteArrayContent(new byte[]{0})};
+            r.Content.Headers.ContentRange=new System.Net.Http.Headers.ContentRangeHeaderValue(0,0,63);
+            r.Headers.Add("X-Sync-Content-Hash","deadbeef");
+            r.Headers.Add("X-Sync-Mtime","2026-09-17T02:00:00+00:00");
+            return r;
+        });
+        using var http=new HttpClient(handler);
+        var api=new OrynoNasSyncApi(http,new Uri("https://example.test"));
+        var meta=await api.GetContentMetadataAsync(Guid.NewGuid(),7);
+        Assert.Equal(63,meta.Size);
+        Assert.Equal("deadbeef",meta.Hash);
+        Assert.NotNull(meta.Mtime);
+        Assert.Equal(1,headCalls);
+        Assert.Equal(1,getCalls);
+    }
+    [Fact] public async Task ContentMetadataUsesHeadWhenServerSupportsIt()
+    {
+        string? method=null;
+        var handler=new RecordingHandler(req=>{method=req.Method.Method;var r=new HttpResponseMessage(HttpStatusCode.OK){Content=new ByteArrayContent(new byte[5])};r.Headers.Add("X-Sync-Content-Hash","abc123");return r;});
+        using var http=new HttpClient(handler);
+        var api=new OrynoNasSyncApi(http,new Uri("https://example.test"));
+        var meta=await api.GetContentMetadataAsync(Guid.NewGuid(),1);
+        Assert.Equal("HEAD",method);
+        Assert.Equal(5,meta.Size);
+        Assert.Equal("abc123",meta.Hash);
+    }
+
+    // §1/§3 regression: инвентарь сервера отдаёт пути со слэшами ("Work/file.txt"), а Scope() — с
+    // обратными. Из-за этого DELETE-операция не находила элемент: помечала Completed без HTTP-запроса,
+    // файл оставался на NAS и следующий reconcile скачивал его обратно (воскрешение).
+    [Fact] public void RemoteIndexNormalizesSeparatorsSoDeleteLookupHits(){
+        var root=Guid.NewGuid();
+        var mapping=new SyncMapping(Guid.NewGuid(),@"E:\Работа",root,"Oryno NAS",true,DateTimeOffset.UtcNow,DateTimeOffset.UtcNow,1,"Ready",null,null,MappingStatus.Syncing,null,"Работа");
+        var items=new[]{new RemoteItemState(Guid.NewGuid(),root,null,"oryno-delete-proof-v2.txt","Работа/oryno-delete-proof-v2.txt","file",41,DateTimeOffset.UtcNow,"9fe5993b",1,1,RemotePlanningState.MetadataOnly)};
+        var index=MappingTransferCoordinator.IndexRemoteItems(items);
+        var scoped=mapping.Scope("oryno-delete-proof-v2.txt");
+        Assert.True(index.ContainsKey(scoped),$"expected {scoped} in [{string.Join(",",index.Keys)}]");}
+
+    // §1/§3 regression: хранилище может содержать оба написания одного пути — индекс не должен падать.
+    [Fact] public void RemoteIndexDeduplicatesBothSpellings(){
+        var root=Guid.NewGuid();
+        var items=new[]{
+            new RemoteItemState(Guid.NewGuid(),root,null,"a.txt","Work/a.txt","file",1,DateTimeOffset.UtcNow,"h1",1,1,RemotePlanningState.MetadataOnly),
+            new RemoteItemState(Guid.NewGuid(),root,null,"a.txt",@"Work\a.txt","file",1,DateTimeOffset.UtcNow,"h2",1,1,RemotePlanningState.MetadataOnly)};
+        var index=MappingTransferCoordinator.IndexRemoteItems(items);
+        Assert.Single(index);Assert.Equal(@"Work\a.txt",index.Keys.First());}
+
     private sealed class FakeMetadataApi(Guid root):ISyncMetadataApi{public readonly Dictionary<string,InventoryPageDto> Pages=[];public List<RemoteChangeDto> Changes=[];public int InventoryCalls;public bool ThrowCursorExpired;public SyncCapabilities Capabilities=>SyncCapabilities.MetadataSync|SyncCapabilities.ChangeFeed;public Task<ConnectionResult> TestConnectionAsync(CancellationToken ct=default)=>Task.FromResult(new ConnectionResult(ConnectionStatus.Connected));public Task<IReadOnlyList<SyncRootDto>> GetSyncRootsAsync(CancellationToken ct=default)=>Task.FromResult<IReadOnlyList<SyncRootDto>>([new(root,"Root",true,"done",42)]);public Task<InventoryPageDto> GetInventoryPageAsync(Guid rootId,string? cursor,int limit,CancellationToken ct=default){InventoryCalls++;return Task.FromResult(Pages[cursor??""]);}public Task<ChangesPageDto> GetChangesPageAsync(Guid rootId,long after,int limit,CancellationToken ct=default){if(ThrowCursorExpired)return Task.FromException<ChangesPageDto>(new SyncApiException(HttpStatusCode.Gone,"SYNC_CURSOR_EXPIRED","expired"));var page=Changes.Where(x=>x.Revision>after).ToArray();return Task.FromResult(new ChangesPageDto(page,page.Length==0?after:page[^1].Revision,false));}}
 }

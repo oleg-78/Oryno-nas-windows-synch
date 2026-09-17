@@ -19,7 +19,19 @@ public sealed class ActivityViewModel : ViewModelBase
     public string Status { get => _status; set => Set(ref _status, value); } public string ConnectionMessage { get => _connectionMessage; set => Set(ref _connectionMessage, value); } public string ConnectionTone { get => _connectionTone; set => Set(ref _connectionTone, value); } public string IndexedText { get => _indexed; set => Set(ref _indexed, value); } public string WaitingText { get => _waiting; set => Set(ref _waiting, value); } public string ErrorsText { get => _errors; set => Set(ref _errors, value); } public string LastSyncText { get => _lastSync; set => Set(ref _lastSync, value); } public string QueueText { get => _queue; set => Set(ref _queue, value); } public string ErrorSummary { get => _errorSummary; set => Set(ref _errorSummary, value); } public string HistoricalErrorsText { get => _historical; set => Set(ref _historical, value); } public bool SyncRunning { get => _syncRunning; set => Set(ref _syncRunning, value); } public bool HasErrors { get => _hasErrors; set => Set(ref _hasErrors, value); } public bool ErrorsExpanded { get => _errorsExpanded; set => Set(ref _errorsExpanded, value); }
     public ObservableCollection<string> Items { get; } = []; public ObservableCollection<SyncFileErrorRowViewModel> ErrorItems { get; } = [];
     public Action? StartSync { get; set; } public Action? StopSync { get; set; } public Action? OpenFolder { get; set; } public Action? RetryErrors { get; set; } public Action<Guid>? RetryOperation { get; set; }
-    public void Add(string value) { Items.Insert(0, value); while (Items.Count > 20) Items.RemoveAt(Items.Count - 1); }
+    private string? _lastActivityKey; private DateTimeOffset _lastActivityAt;
+    public void Add(string value)
+    {
+        // §0/§16: Recently synced must show real file events only. Internal reconciliation lines used to be
+        // re-added verbatim every few seconds ("Sync", "Sync", "Sync") and made the client look permanently busy.
+        var key = value;
+        var sep = value.IndexOf("  ", StringComparison.Ordinal);
+        if (sep >= 0) key = value[sep..].TrimStart();
+        if (key.Length == 0 || key.Equals("Sync", StringComparison.OrdinalIgnoreCase) || key.Equals("Rebuild", StringComparison.OrdinalIgnoreCase)) return;
+        if (key.Equals(_lastActivityKey, StringComparison.Ordinal) && DateTimeOffset.UtcNow - _lastActivityAt < TimeSpan.FromSeconds(60)) return;
+        _lastActivityKey = key; _lastActivityAt = DateTimeOffset.UtcNow;
+        Items.Insert(0, value); while (Items.Count > 20) Items.RemoveAt(Items.Count - 1);
+    }
     public void ApplySummary(SyncDashboardSummary s) { IndexedText = s.IndexedFiles.ToString("N0"); WaitingText = s.WaitingCount.ToString("N0"); ErrorsText = s.ErrorCount.ToString("N0"); QueueText = s.WaitingCount == 0 ? "No local changes waiting" : $"{s.WaitingCount:N0} changes waiting safely"; LastSyncText = s.LastSuccessfulFileSync is null ? "No successful file sync yet" : s.LastSuccessfulFileSync.Value.LocalDateTime.ToString("g"); HasErrors = s.ErrorCount > 0; ErrorSummary = HasErrors ? $"{s.ErrorCount:N0} files need attention" : "No sync errors"; HistoricalErrorsText = s.HistoricalErrorCount == 0 ? "No resolved history" : $"{s.HistoricalErrorCount:N0} resolved/archived (not counted as active)"; }
     public void SetErrors(IReadOnlyList<SyncFileError> errors) { var ids = errors.Select(x => x.OperationId).ToHashSet(); foreach (var row in ErrorItems.Where(x => !ids.Contains(x.OperationId)).ToArray()) ErrorItems.Remove(row); for (var i = 0; i < errors.Count; i++) { var old = ErrorItems.FirstOrDefault(x => x.OperationId == errors[i].OperationId); if (old is null) ErrorItems.Insert(i, new SyncFileErrorRowViewModel(errors[i]) { Retry = () => RetryOperation?.Invoke(errors[i].OperationId) }); else old.Apply(errors[i]); } }
 }

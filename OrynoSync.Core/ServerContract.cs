@@ -250,7 +250,33 @@ public sealed class OrynoNasSyncApi : ISyncApi, ISyncMetadataApi, IContentTransf
     public Task<RemoteItemDto> CreateFolderAsync(Guid rootId,Guid? parentItemId,string name,Guid operationId,CancellationToken ct=default)=>PostAsync<RemoteItemDto>($"roots/{rootId:D}/folders",new FolderCreateRequest(parentItemId,name,operationId),ct);
     public Task<RemoteItemDto> MoveItemAsync(Guid itemId,Guid? newParentId,string? newName,long? baseVersion,Guid operationId,CancellationToken ct=default)=>PostAsync<RemoteItemDto>($"items/{itemId:D}/move",new MoveRequest(newParentId,newName,baseVersion,operationId),ct);
     public async Task DeleteItemAsync(Guid itemId,Guid operationId,CancellationToken ct=default){using var r=await _http.DeleteAsync($"items/{itemId:D}?operation_id={operationId:D}",ct);if(!r.IsSuccessStatusCode)await ThrowResponseAsync(r,ct);}
-    public async Task<(long Size,string Hash,DateTimeOffset? Mtime)> GetContentMetadataAsync(Guid itemId,long version,CancellationToken ct=default){using var r=await _http.SendAsync(new HttpRequestMessage(HttpMethod.Head,$"items/{itemId:D}/content?version={version}"),HttpCompletionOption.ResponseHeadersRead,ct);if(!r.IsSuccessStatusCode)await ThrowResponseAsync(r,ct);return (r.Content.Headers.ContentLength??0,r.Headers.TryGetValues("X-Sync-Content-Hash",out var h)?h.Single():"",r.Headers.TryGetValues("X-Sync-Mtime",out var m)&&DateTimeOffset.TryParse(m.Single(),out var dt)?dt:null);}
+    public async Task<(long Size,string Hash,DateTimeOffset? Mtime)> GetContentMetadataAsync(Guid itemId,long version,CancellationToken ct=default)
+    {
+        // §4: authoritative content metadata (size/hash/mtime) without downloading the body.
+        // Contract: HEAD + X-Sync-* headers. A server that does not implement HEAD (405/501) used to
+        // surface as "Server content hash unavailable" + a fresh conflict copy on every cycle; fall
+        // back to a 1-byte ranged GET, which returns the same headers (206 + Content-Range).
+        using var head=await _http.SendAsync(new HttpRequestMessage(HttpMethod.Head,$"items/{itemId:D}/content?version={version}"),HttpCompletionOption.ResponseHeadersRead,ct);
+        if(head.StatusCode==HttpStatusCode.MethodNotAllowed||head.StatusCode==HttpStatusCode.NotImplemented)
+        {
+            SyncDiagnostics.Report("CONTENT_METADATA_HEAD_UNSUPPORTED",$"status={(int)head.StatusCode} item_id={itemId:D} version={version} fallback=range_get");
+            using var get=await _http.SendAsync(RangedContentRequest(itemId,version),HttpCompletionOption.ResponseHeadersRead,ct);
+            if(get.StatusCode==HttpStatusCode.RequestedRangeNotSatisfiable)
+            {
+                // нулевой файл: Range bytes=0-0 невыполним — берём метаданные обычным GET
+                using var plain=await _http.SendAsync(new HttpRequestMessage(HttpMethod.Get,$"items/{itemId:D}/content?version={version}"),HttpCompletionOption.ResponseHeadersRead,ct);
+                if(!plain.IsSuccessStatusCode)await ThrowResponseAsync(plain,ct);
+                return (plain.Content.Headers.ContentLength??0,HeaderHash(plain),HeaderMtime(plain));
+            }
+            if(!get.IsSuccessStatusCode)await ThrowResponseAsync(get,ct);
+            return (get.Content.Headers.ContentRange?.Length??get.Content.Headers.ContentLength??0,HeaderHash(get),HeaderMtime(get));
+        }
+        if(!head.IsSuccessStatusCode)await ThrowResponseAsync(head,ct);
+        return (head.Content.Headers.ContentLength??0,HeaderHash(head),HeaderMtime(head));
+    }
+    private static HttpRequestMessage RangedContentRequest(Guid itemId,long version){var request=new HttpRequestMessage(HttpMethod.Get,$"items/{itemId:D}/content?version={version}");request.Headers.Range=new RangeHeaderValue(0,0);return request;}
+    private static string HeaderHash(HttpResponseMessage r)=>r.Headers.TryGetValues("X-Sync-Content-Hash",out var h)?h.FirstOrDefault()??"":"";
+    private static DateTimeOffset? HeaderMtime(HttpResponseMessage r)=>r.Headers.TryGetValues("X-Sync-Mtime",out var m)&&DateTimeOffset.TryParse(m.FirstOrDefault(),out var dt)?dt:null;
     public async Task DownloadRangeAsync(Guid itemId,long version,long offset,Stream destination,CancellationToken ct=default){using var request=new HttpRequestMessage(HttpMethod.Get,$"items/{itemId:D}/content?version={version}");request.Headers.Range=new RangeHeaderValue(offset,null);using var r=await _http.SendAsync(request,HttpCompletionOption.ResponseHeadersRead,ct);await ReadResponseHeadersAsync(r,ct);await using var source=await r.Content.ReadAsStreamAsync(ct);await source.CopyToAsync(destination,131072,ct);}
     private async Task<T> PostAsync<T>(string path,object payload,CancellationToken ct){using var r=await _http.PostAsJsonAsync(path,payload,Json,ct);return await ReadResponseAsync<T>(r,ct);}
     private async Task<T> ReadResponseAsync<T>(HttpResponseMessage r,CancellationToken ct){if(!r.IsSuccessStatusCode)await ThrowResponseAsync(r,ct);return await r.Content.ReadFromJsonAsync<T>(Json,ct)??throw new SyncApiException(r.StatusCode,"INVALID_RESPONSE","Empty or invalid server response.");}

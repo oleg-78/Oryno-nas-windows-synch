@@ -246,7 +246,9 @@ public sealed class SyncMappingRuntimeManager(ISyncMappingStore store) : IDispos
                 foreach (var missing in oldItems.Values.Where(x => !seen.Contains(x.RelativePath) && !ignores.IsIgnored(x.RelativePath)))
                 {
                     ct.ThrowIfCancellationRequested();
-                    await _store.RemoveItemAsync(_mapping.MappingId, missing.RelativePath, ct);
+                    // §1: keep a tombstone (DeletedLocal) instead of forgetting the item. The executor and
+                    // the queue planner use it to send a server DELETE instead of re-downloading the file.
+                    await _store.UpsertItemAsync(missing with { SyncState = SyncItemState.DeletedLocal }, ct);
                     await EnqueueAsync(OperationType.Delete, missing.RelativePath, ct);
                     changes++;
                 }
@@ -325,16 +327,38 @@ public sealed class SyncMappingRuntimeManager(ISyncMappingStore store) : IDispos
             _ = ApplyAsync(type, rel, oldPath, cts.Token);
         }
 
+        /// <summary>§1/§3: persist a local delete intent (tombstone) so the sync loop propagates DELETE
+        /// instead of downloading the file back. Cleared only by a successful server delete or by the user
+        /// creating the file again.</summary>
+        private async Task MarkDeleteIntentAsync(string rel, CancellationToken ct)
+        {
+            try
+            {
+                await _store.UpsertItemAsync(new(_mapping.MappingId, PathRules.NormalizeRelative(rel), ItemType.File, 0, DateTimeOffset.UtcNow, SyncItemState.DeletedLocal), ct);
+            }
+            catch (Exception e) when (e is not OperationCanceledException)
+            {
+                _activity($"Could not record local delete intent for {rel}: {e.Message}");
+            }
+        }
+
         private async Task ApplyAsync(WatcherChangeTypes type, string rel, string? oldPath, CancellationToken ct)
         {
             try
             {
+                // §1: a local delete intent must be durable BEFORE the debounce window, otherwise a
+                // remote-only pass that is already running can re-download the file we just deleted
+                // (observed: proof file came back with the server's mtime).
+                if (type == WatcherChangeTypes.Deleted && !new IgnoreRules().IsIgnored(rel))
+                    await MarkDeleteIntentAsync(rel, ct);
                 await Task.Delay(750, ct);
                 _debounce.Remove(rel);
                 var full = PathRules.ToAbsolute(_mapping.LocalPath, rel);
                 if (type == WatcherChangeTypes.Deleted || (!File.Exists(full) && !Directory.Exists(full)))
                 {
-                    await _store.RemoveItemAsync(_mapping.MappingId, rel, ct);
+                    // §1: local delete intent survives the mistake-proofing in the store's EnqueueAsync
+                    // (an unresolved error used to swallow the DELETE, and the file came back on the next poll).
+                    await MarkDeleteIntentAsync(rel, ct);
                     await EnqueueAsync(OperationType.Delete, rel, ct);
                 }
                 else if (type == WatcherChangeTypes.Renamed && oldPath is not null)

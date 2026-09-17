@@ -80,6 +80,9 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
     public event Action<SyncActivityEvent>? DiagnosticLog;
 
     private readonly HashSet<string> _blockedCanonicalPaths = new(StringComparer.OrdinalIgnoreCase);
+    // §0/§4: одна conflict-копия на (путь, item, версию, хэш). Без этого remote-only проход
+    // материализовал НОВУЮ копию каждый цикл (имя с текущей секундой) — шторм из десятков файлов.
+    private readonly HashSet<string> _materializedConflicts = new(StringComparer.OrdinalIgnoreCase);
     private readonly DuplicateDiagnosticDedup _diagnosticDedup = new();
 
     public int ActiveTransfers => _scheduler.ActiveCount;
@@ -103,27 +106,31 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
         var remoteResolution = DuplicateCanonicalResolver.ResolveRemote(remoteItems,
             (path, rootId, ids) => LogDiagnosticDeduped("REBUILD_DUPLICATE", mapping.MappingId, path, ids));
         
+        // §0: internal reconciliation must not surface as a user sync event.
         if (remoteResolution.Conflicts.Count > 0)
         {
             var details = string.Join("; ", remoteResolution.Conflicts.Select(d => d));
-            await RecordAsync(mapping, "", "Rebuild", "Info", $"Resolved {remoteResolution.Conflicts.Count} duplicate canonical paths: {details}", ct);
+            LogDiagnosticDeduped("REBUILD_AMBIGUOUS_PATHS", mapping.MappingId, "", details);
         }
         
         var remote = remoteResolution.Items;
         var oldPending = await mappings.GetPendingAsync(mapping.MappingId, DateTimeOffset.MaxValue, ct);
         var desired = await SnapshotAsync(mapping.LocalPath, ct);
-        var plan = QueueNormalizer.Plan(desired, remote, oldPending);
+        var trackedItems = (await mappings.GetItemsAsync(mapping.MappingId, ct))
+            .GroupBy(x => PathRules.NormalizeRelative(x.RelativePath), StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(g => g.Key, g => g.OrderByDescending(x => x.Mtime).First(), StringComparer.OrdinalIgnoreCase);
+        var plan = QueueNormalizer.Plan(desired, remote, oldPending, trackedItems);
         
         var normalized = new List<MappingPendingOperation>();
         // Add conflicts from duplicate resolution
         normalized.AddRange(remoteResolution.Conflicts.Select(path => 
             new MappingPendingOperation(Guid.NewGuid(), mapping.MappingId, OperationType.Conflict, path, 
-                null, DateTimeOffset.UtcNow, 0, DateTimeOffset.MaxValue, OperationState.FailedPermanent, 
+                null, DateTimeOffset.UtcNow, 0, DateTimeOffset.UtcNow, OperationState.Pending, 
                 "SYNC_CONFLICT: duplicate items with different content on server.")));
         // Add conflicts from queue normalizer
         normalized.AddRange(plan.Conflicts.Select(path => 
             new MappingPendingOperation(Guid.NewGuid(), mapping.MappingId, OperationType.Conflict, path, 
-                null, DateTimeOffset.UtcNow, 0, DateTimeOffset.MaxValue, OperationState.FailedPermanent, 
+                null, DateTimeOffset.UtcNow, 0, DateTimeOffset.UtcNow, OperationState.Pending, 
                 "SYNC_CONFLICT: local and NAS content differ.")));
         normalized.AddRange(plan.Operations.Select(operation => 
             new MappingPendingOperation(Guid.NewGuid(), mapping.MappingId, operation.Type, operation.RelativePath, 
@@ -149,6 +156,17 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
             }
         }
         var items = desired.Select(item => new MappingLocalItem(mapping.MappingId, item.RelativePath, item.ItemType, item.Size, item.Mtime, item.ItemType == ItemType.File && remoteByPath.TryGetValue(item.RelativePath, out var r) && string.Equals(item.ContentHash, r.ContentHash, StringComparison.OrdinalIgnoreCase) ? SyncItemState.Synced : SyncItemState.Waiting)).ToArray();
+        // §1/§5: a full rebuild used to drop every tracking row, which erased the local delete intents and
+        // let the file be downloaded again on the next poll. Tombstones survive the rebuild.
+        var tombstonedPaths = desired.Select(x => PathRules.NormalizeRelative(x.RelativePath)).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var carriedTombstones = (await mappings.GetItemsAsync(mapping.MappingId, ct))
+            .Where(x => x.SyncState == SyncItemState.DeletedLocal && !tombstonedPaths.Contains(PathRules.NormalizeRelative(x.RelativePath)))
+            .ToArray();
+        if (carriedTombstones.Length > 0)
+        {
+            LogDiagnosticDeduped("REBUILD_TOMBSTONES_KEPT", mapping.MappingId, "", $"{carriedTombstones.Length} local delete intent(s) preserved");
+            items = items.Concat(carriedTombstones).ToArray();
+        }
         await mappings.ReplaceItemsAsync(mapping.MappingId, items, ct);
         await mappings.ReplacePendingAsync(mapping.MappingId, normalized, ct);
         await mappings.UpdateMappingAsync(mapping with { InventoryState = "Normalized", Status = normalized.Count == 0 ? MappingStatus.UpToDate : MappingStatus.ReadyToSync, UpdatedAt = DateTimeOffset.UtcNow }, ct);
@@ -174,7 +192,12 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
         var remoteItems = (await remoteState.GetRemoteItemsAsync(rootId, ct)).Where(x => !x.IsDeleted).ToArray();
         var remoteResolution = DuplicateCanonicalResolver.ResolveRemote(remoteItems,
             (path, rootId, ids) => LogDiagnosticDeduped("PROCESS_DUPLICATE", mapping.MappingId, path, ids));
-        var remote = remoteResolution.Items.ToDictionary(x => x.RelativePath, StringComparer.OrdinalIgnoreCase);
+        // FIX (§1/§3): the server inventory stores paths with FORWARD slashes ("Work/file.txt") while
+        // mapping.Scope() produces the canonical backslash form. Keying the executor dictionary with the
+        // raw value made every lookup by Scope() miss: DELETE then took the "already absent from server"
+        // shortcut, reported Completed — and the file stayed on the NAS, so the next reconcile
+        // re-downloaded it (resurrection). Normalize keys, and de-duplicate (a collision used to throw).
+        var remote = IndexRemoteItems(remoteResolution.Items);
         
         // FIX: Track blocked canonical paths to prevent any mutation operations on them
         _blockedCanonicalPaths.Clear();
@@ -183,11 +206,11 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
             _blockedCanonicalPaths.Add(PathRules.NormalizeRelative(conflict));
         }
         
-        if (remoteResolution.Conflicts.Count > 0)
-        {
-            var details = string.Join("; ", remoteResolution.Conflicts.Select(d => d));
-            await RecordAsync(mapping, "", "Sync", "Info", $"Blocked {remoteResolution.Conflicts.Count} ambiguous paths from mutation: {details}", ct);
-        }
+        // §0/§16: the per-cycle "Blocked N ambiguous paths" notice is NOT a user sync event and NOT a
+        // separate diagnostic either: every ambiguous path is already reported (deduplicated) by the
+        // PROCESS_DUPLICATE diagnostic from the resolver above. This used to be written to Activity on
+        // every loop iteration, which is what produced the endless "Sync / Sync / Sync" rows.
+        // The paths themselves stay blocked via _blockedCanonicalPaths below.
         
         // FIX: Block existing pending operations on conflict paths BEFORE scheduler
         await BlockPendingOperationsOnConflictPathsAsync(mapping, ct);
@@ -219,7 +242,7 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
                 .Where(x => !x.IsDeleted && mapping.InDestination(x.RelativePath))
                 .Select(x => { var rel = mapping.ToLocalRel(x.RelativePath); return rel is null ? null : x with { RelativePath = rel }; })
                 .Where(x => x is not null).Select(x => x!).ToArray();
-            var plan = QueueNormalizer.Plan(desired, remoteInDestination, pending);
+            var plan = QueueNormalizer.Plan(desired, remoteInDestination, pending, local);
             var normalized = new List<MappingPendingOperation>();
             foreach (var dup in remoteResolution.Conflicts)
             {
@@ -227,16 +250,47 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
                 if (localRel is not null)
                 {
                     normalized.Add(new MappingPendingOperation(Guid.NewGuid(), mapping.MappingId, OperationType.Conflict, 
-                        localRel, null, DateTimeOffset.UtcNow, 0, DateTimeOffset.MaxValue, OperationState.FailedPermanent, 
+                        localRel, null, DateTimeOffset.UtcNow, 0, DateTimeOffset.UtcNow, OperationState.Pending, 
                         "SYNC_CONFLICT: duplicate items with different content on server."));
                 }
             }
-            normalized.AddRange(plan.Conflicts.Select(path => new MappingPendingOperation(Guid.NewGuid(), mapping.MappingId, OperationType.Conflict, path, null, DateTimeOffset.UtcNow, 0, DateTimeOffset.MaxValue, OperationState.FailedPermanent, "SYNC_CONFLICT: local and NAS content differ.")));
+            normalized.AddRange(plan.Conflicts.Select(path => new MappingPendingOperation(Guid.NewGuid(), mapping.MappingId, OperationType.Conflict, path, null, DateTimeOffset.UtcNow, 0, DateTimeOffset.UtcNow, OperationState.Pending, "SYNC_CONFLICT: local and NAS content differ.")));
             normalized.AddRange(plan.Operations.Select(operation => new MappingPendingOperation(Guid.NewGuid(), mapping.MappingId, operation.Type, operation.RelativePath, null, DateTimeOffset.UtcNow, 0, DateTimeOffset.UtcNow, OperationState.Pending, null)));
             await mappings.ReplacePendingAsync(mapping.MappingId, normalized, ct);
             await mappings.UpdateMappingAsync(mapping with { InventoryState = "Normalized", UpdatedAt = DateTimeOffset.UtcNow }, ct);
             pending = normalized.Where(x => x.State is OperationState.Pending or OperationState.Failed or OperationState.FailedPermanent).ToArray();
         }
+        
+        // §1/§3: propagate local delete intents. A DeletedLocal tombstone means "the user removed this
+        // locally". Any obsolete upload for that path is cancelled (it must not resurrect the file) and a
+        // DELETE is queued for the NAS side, even when an old error still claimed the path.
+        var pendingList = pending.ToList();
+        foreach (var tombstone in local.Values.Where(x => x.SyncState == SyncItemState.DeletedLocal))
+        {
+            var rel = PathRules.NormalizeRelative(tombstone.RelativePath);
+            if (_ignores.IsIgnored(rel)) continue;
+            if (!remote.TryGetValue(mapping.Scope(rel), out var remoteItem) || remoteItem.IsDeleted) continue;
+
+            var obsolete = pendingList.Where(p => PathRules.NormalizeRelative(p.RelativePath).Equals(rel, StringComparison.OrdinalIgnoreCase)
+                                                  && p.Type is OperationType.CreateFile or OperationType.UpdateFile or OperationType.Conflict).ToArray();
+            foreach (var opById in obsolete)
+            {
+                await mappings.UpdateOperationAsync(opById with { State = OperationState.Cancelled, LastError = "Superseded by local delete intent" }, ct);
+                pendingList.Remove(opById);
+            }
+
+            if (pendingList.Any(p => p.Type == OperationType.Delete
+                                     && PathRules.NormalizeRelative(p.RelativePath).Equals(rel, StringComparison.OrdinalIgnoreCase)
+                                     && p.State is OperationState.Pending or OperationState.Retrying or OperationState.InProgress))
+                continue;
+
+            var deleteOp = new MappingPendingOperation(Guid.NewGuid(), mapping.MappingId, OperationType.Delete, rel,
+                null, DateTimeOffset.UtcNow, 0, DateTimeOffset.UtcNow, OperationState.Pending, null);
+            await mappings.EnqueueAsync(deleteOp, ct);
+            pendingList.Add(deleteOp);
+            LogDiagnosticDeduped("LOCAL_DELETE_INTENT", mapping.MappingId, rel, "queued DELETE for NAS");
+        }
+        pending = pendingList.ToArray();
         
         // Re-read status from DB to get fresh state
         var freshMapping = await mappings.GetMappingAsync(mapping.MappingId, ct) ?? mapping;
@@ -346,11 +400,21 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
         return ex switch
         {
             SyncApiException apiError => apiError.Code is "SYNC_CONFLICT" or "SYNC_NAME_CONFLICT" 
-                or "SYNC_HASH_MISMATCH" or "SYNC_NAME_INVALID",
+                or "SYNC_HASH_MISMATCH" or "SYNC_NAME_INVALID" or "SYNC_HASH_UNAVAILABLE_PERMANENT",
             // FileChangedDuringTransferException is RETRYABLE, not permanent
             _ => false
         };
     }
+
+    /// <summary>§1/§3: index the server inventory by canonical relative path.
+    /// The server reports paths with forward slashes ("Work/file.txt") while <see cref="SyncMapping.Scope"/>
+    /// emits the canonical backslash form, so keying by the raw value made every Scope() lookup miss:
+    /// DELETE then took the "already absent from server" shortcut and reported Completed without any HTTP
+    /// request — the file stayed on the NAS and the next reconcile re-downloaded it (resurrection).
+    /// Duplicate canonical paths are de-duplicated instead of throwing (the store can hold both spellings).</summary>
+    public static Dictionary<string, RemoteItemState> IndexRemoteItems(IEnumerable<RemoteItemState> items) =>
+        items.GroupBy(x => PathRules.NormalizeRelative(x.RelativePath), StringComparer.OrdinalIgnoreCase)
+             .ToDictionary(g => g.Key, g => g.First(), StringComparer.OrdinalIgnoreCase);
 
     private static async Task<IReadOnlyList<DesiredLocalItem>> SnapshotAsync(string root, CancellationToken ct)
     {
@@ -412,6 +476,13 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
                 await mappings.UpsertItemAsync(new(mapping.MappingId, rel, ItemType.Directory, 0, DateTimeOffset.UtcNow, SyncItemState.Synced), ct);
                 break;
             case OperationType.DownloadFile:
+                // §1: a queued download for a path the user deleted locally must not re-materialise it.
+                if (await HasDeleteIntentAsync(mapping, rel, ct))
+                {
+                    await mappings.UpdateOperationAsync(op with { State = OperationState.Cancelled, LastError = "Superseded by local delete intent" }, ct);
+                    await RecordAsync(mapping, op.RelativePath, "Deleted", "Synced", "Local delete intent: queued download cancelled.", ct);
+                    return;
+                }
                 if (existing is null || existing.ContentHash is null) throw new SyncApiException(System.Net.HttpStatusCode.NotFound, "SYNC_CONTENT_MISSING", "Remote content metadata is unavailable.");
                 var currentItem = await api.GetItemAsync(existing.ItemId, ct);
                 var downloadPath = PathRules.ToAbsolute(mapping.LocalPath, rel); Directory.CreateDirectory(Path.GetDirectoryName(downloadPath)!);
@@ -426,7 +497,10 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
                 await UpdateLastSuccessfulFileSync(mapping);
                 break;
             case OperationType.Conflict:
-                throw new SyncApiException(System.Net.HttpStatusCode.Conflict, "SYNC_CONFLICT", "This item was changed both locally and on Oryno NAS.");
+                // §4: never declare a content conflict from a possibly stale cache entry.
+                // Re-read authoritative server metadata, hash the local file, then decide.
+                await VerifyConflictAuthoritativelyAsync(mapping, rootId, op, remote, local, ct);
+                break;
         }
         
         await mappings.UpdateOperationAsync(op with { State = OperationState.Completed, LastError = null, NextAttemptAt = DateTimeOffset.MaxValue }, ct);
@@ -580,7 +654,7 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
             
             if (actualItem.ItemType.Equals("file", StringComparison.OrdinalIgnoreCase))
             {
-                var serverMeta = await GetServerContentMetadataAsync(actualItem.ItemId, actualItem.Version, ct);
+                var serverMeta = await GetServerContentMetadataDetailedAsync(actualItem.ItemId, actualItem.Version, ct);
                 
                 if (serverMeta.Hash is not null)
                 {
@@ -599,14 +673,20 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
                     }
                     else
                     {
+                        // §4: hash mismatch that survived an authoritative refresh → real content conflict.
                         throw new SyncApiException(System.Net.HttpStatusCode.Conflict, "SYNC_CONFLICT",
-                            $"Name conflict: file {remoteRel} exists on server with different content");
+                            $"Conflict: file {remoteRel} exists on Oryno NAS with different content (local {Short(hash)} vs server {Short(serverMeta.Hash)}). Nothing was overwritten.");
                     }
                 }
                 else
                 {
-                    throw new SyncApiException(System.Net.HttpStatusCode.Conflict, "SYNC_CONFLICT",
-                        $"Name conflict: file {remoteRel} exists on server but server did not provide content hash for verification");
+                    // §4: NOT a name conflict — the server simply did not hand us a hash (stale version,
+                    // missing blob, transport error). Report that precisely and retry a bounded number of
+                    // times instead of permanently blocking the path with a misleading message.
+                    var message = $"Server content hash unavailable for {remoteRel} ({serverMeta.ErrorCode}: {serverMeta.ErrorMessage}). Nothing was overwritten.";
+                    if (op.AttemptCount >= 5)
+                        throw new SyncApiException(System.Net.HttpStatusCode.Conflict, "SYNC_HASH_UNAVAILABLE_PERMANENT", message);
+                    throw new SyncApiException(System.Net.HttpStatusCode.ServiceUnavailable, "SYNC_HASH_UNAVAILABLE", message);
                 }
             }
             
@@ -646,25 +726,102 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
     {
         if (!remote.TryGetValue(remoteRel, out var existing))
         {
-            await RecordAsync(mapping, op.RelativePath, "Deleted", "Synced", "Already absent from server", ct);
-            return;
+            // §1/§3: a local-cache miss is NOT proof that the server item is gone — the cache can be
+            // stale or keyed differently. Ask the server for the authoritative item first; only a real
+            // server-side absence closes the delete intent.
+            existing = mapping.ServerRootId is { } rid
+                ? await FindActualServerItemAsync(rid, remoteRel, remote, ct)
+                : null;
+            if (existing is null)
+            {
+                await mappings.RemoveItemAsync(mapping.MappingId, op.RelativePath, ct);
+                await RecordAsync(mapping, op.RelativePath, "Deleted", "Synced", "Already absent from server", ct);
+                return;
+            }
         }
         
         try
         {
             await api.DeleteItemAsync(existing.ItemId, op.OperationId, ct);
             remote.Remove(remoteRel);
+            // §1/§3: drop the tombstone only after the server delete succeeded, so a failed delete
+            // can never be silently followed by a re-download.
+            await mappings.RemoveItemAsync(mapping.MappingId, op.RelativePath, ct);
             await RecordAsync(mapping, op.RelativePath, "Deleted", "Synced", null, ct);
         }
         catch (SyncApiException e) when (e.Code == "SYNC_ITEM_NOT_FOUND")
         {
             remote.Remove(remoteRel);
+            await mappings.RemoveItemAsync(mapping.MappingId, op.RelativePath, ct);
             await RecordAsync(mapping, op.RelativePath, "Deleted", "Synced", "Item already absent from server", ct);
         }
     }
 
+    /// <summary>§1: true when the mapping carries a local delete intent (tombstone) for the path or any of
+    /// its parents — used to cancel a queued download before it re-materialises a file the user deleted.</summary>
+    private async Task<bool> HasDeleteIntentAsync(SyncMapping mapping, string localRel, CancellationToken ct)
+    {
+        try
+        {
+            var norm = PathRules.NormalizeRelative(localRel);
+            foreach (var item in await mappings.GetItemsAsync(mapping.MappingId, ct))
+            {
+                if (item.SyncState != SyncItemState.DeletedLocal) continue;
+                var t = PathRules.NormalizeRelative(item.RelativePath);
+                if (norm.Equals(t, StringComparison.OrdinalIgnoreCase)) return true;
+                if (norm.StartsWith(t + "\\", StringComparison.OrdinalIgnoreCase)) return true;
+                if (norm.StartsWith(t + "/", StringComparison.OrdinalIgnoreCase)) return true;
+            }
+        }
+        catch (Exception e) when (e is not OperationCanceledException)
+        {
+            LogDiagnosticDeduped("DELETE_INTENT_LOOKUP_FAILED", mapping.MappingId, localRel, e.Message);
+        }
+        return false;
+    }
+
     private async Task ApplyRemoteOnlyAsync(SyncMapping mapping, Guid rootId, IReadOnlyDictionary<string, RemoteItemState> remote, IReadOnlyDictionary<string, MappingLocalItem> local, CancellationToken ct)
     {
+        // §1/§3: local delete intent. A tracked path whose local file is gone (or any path below a
+        // deleted tracked directory) must never be re-materialised from the server — that was the
+        // "file resurrects after I delete it" bug.
+        var tombstones = local.Values
+            .Where(x => x.SyncState == SyncItemState.DeletedLocal)
+            .Select(x => PathRules.NormalizeRelative(x.RelativePath))
+            .ToArray();
+        bool Tombstoned(string rel)
+        {
+            foreach (var t in tombstones)
+            {
+                if (rel.Equals(t, StringComparison.OrdinalIgnoreCase)) return true;
+                if (rel.StartsWith(t + "\\", StringComparison.OrdinalIgnoreCase)) return true;
+                if (rel.StartsWith(t + "/", StringComparison.OrdinalIgnoreCase)) return true;
+            }
+            return false;
+        }
+
+        // §1: the snapshot above is taken once per cycle; the user can delete a file while this cycle is
+        // already running. Re-read the tombstones (throttled to one query every 2s) before materialising
+        // anything from the server, so a delete issued mid-cycle cannot be undone by this pass.
+        var tombstonesRefreshedAt = DateTimeOffset.UtcNow;
+        async Task<bool> DeleteIntentAsync(string rel)
+        {
+            if ((DateTimeOffset.UtcNow - tombstonesRefreshedAt).TotalSeconds >= 2)
+            {
+                try
+                {
+                    var fresh = await mappings.GetItemsAsync(mapping.MappingId, ct);
+                    tombstones = fresh.Where(x => x.SyncState == SyncItemState.DeletedLocal).Select(x => PathRules.NormalizeRelative(x.RelativePath)).ToArray();
+                }
+                catch (Exception e) when (e is not OperationCanceledException)
+                {
+                    LogDiagnosticDeduped("DELETE_INTENT_LOOKUP_FAILED", mapping.MappingId, rel, e.Message);
+                }
+                tombstonesRefreshedAt = DateTimeOffset.UtcNow;
+            }
+            return Tombstoned(rel);
+        }
+
         var pendingPaths = (await mappings.GetPendingAsync(mapping.MappingId, DateTimeOffset.MaxValue, ct)).Select(x => PathRules.NormalizeRelative(x.RelativePath)).ToHashSet(StringComparer.OrdinalIgnoreCase);
         foreach (var item in remote.Values.OrderBy(x => x.RelativePath.Count(c => c == '\\')).OrderBy(x => x.RelativePath.Count(c => c == '/')))
         {
@@ -674,6 +831,7 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
             if (_ignores.IsIgnored(localRel)) continue;
             if (!PathRules.IsWindowsCompatible(localRel)) { await RecordAsync(mapping, item.RelativePath, "Download", "Error", "invalid filename: Windows cannot materialize this path.", ct); continue; }
             var full = PathRules.ToAbsolute(mapping.LocalPath, localRel);
+            if (await DeleteIntentAsync(localRel)) continue; // §1: local delete intent — propagate delete, never re-download
             if (item.ItemType.Equals("directory", StringComparison.OrdinalIgnoreCase)) { Directory.CreateDirectory(full); continue; }
             if (item.ContentHash is null) continue;
             if (File.Exists(full))
@@ -682,6 +840,16 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
                 if (string.Equals(localHash, item.ContentHash, StringComparison.OrdinalIgnoreCase)) continue;
                 if (pendingPaths.Contains(localRel))
                 {
+                    // §0/§4: конфликт объявляем и материализуем РОВНО ОДИН раз на версию серверного файла.
+                    // Иначе каждый reconcile-цикл (пока локальная операция висит в pending) плодил
+                    // новую "(conflict Oryno <секунда>)" копию — десятки файлов за минуты.
+                    var conflictKey = $"{localRel}|{item.ItemId:D}|{item.Version}|{item.ContentHash}";
+                    if (_materializedConflicts.Contains(conflictKey) || ConflictCopyMaterialized(full, item.SizeBytes ?? 0))
+                    {
+                        _materializedConflicts.Add(conflictKey);
+                        continue;
+                    }
+                    _materializedConflicts.Add(conflictKey);
                     var conflict = ConflictCopyPath(full);
                     try
                     {
@@ -789,26 +957,108 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
 
     private async Task<(long Size, string? Hash)> GetServerContentMetadataAsync(Guid itemId, long version, CancellationToken ct)
     {
+        var meta = await GetServerContentMetadataDetailedAsync(itemId, version, ct);
+        return (meta.Size, meta.Hash);
+    }
+
+    /// <summary>
+    /// §4: same HEAD request, but the failure reason is preserved instead of being swallowed.
+    /// A swallowed 409/404 was reported to the user as "server did not provide content hash",
+    /// which then surfaced as a bogus name conflict.
+    /// </summary>
+    private async Task<(long Size, string? Hash, string ErrorCode, string ErrorMessage)> GetServerContentMetadataDetailedAsync(Guid itemId, long version, CancellationToken ct)
+    {
         try
         {
             var meta = await api.GetContentMetadataAsync(itemId, version, ct);
-            return (meta.Size, meta.Hash);
+            return (meta.Size, string.IsNullOrWhiteSpace(meta.Hash) ? null : meta.Hash, "OK", "");
         }
-        catch
+        catch (SyncApiException e)
         {
-            return (0, null);
+            LogDiagnosticDeduped("CONTENT_METADATA_UNAVAILABLE", Guid.Empty, itemId.ToString("D"), $"{e.Code}: {e.Message}");
+            return (0, null, e.Code, e.Message);
+        }
+        catch (Exception e)
+        {
+            LogDiagnosticDeduped("CONTENT_METADATA_UNAVAILABLE", Guid.Empty, itemId.ToString("D"), e.Message);
+            return (0, null, "SYNC_METADATA_REQUEST_FAILED", e.Message);
         }
     }
+
+    /// <summary>
+    /// §4: authoritative conflict verification. Cache hashes are advisory only; before telling the user
+    /// "this was changed on both sides" we re-read server metadata and hash the local file.
+    ///   hashes equal  → bind the item as Synced (conflict resolved, nothing rewritten);
+    ///   hashes differ → real conflict, reported with both hashes and no overwrite;
+    ///   no server hash → precise "Server content hash unavailable" (retryable), never a fake conflict.
+    /// </summary>
+    private async Task VerifyConflictAuthoritativelyAsync(SyncMapping mapping, Guid rootId, MappingPendingOperation op,
+        Dictionary<string, RemoteItemState> remote, IReadOnlyDictionary<string, MappingLocalItem> local, CancellationToken ct)
+    {
+        var rel = PathRules.NormalizeRelative(op.RelativePath);
+        var remoteRel = mapping.Scope(rel);
+        var full = PathRules.ToAbsolute(mapping.LocalPath, rel);
+
+        if (!File.Exists(full))
+        {
+            // Local copy is gone → there is nothing conflicting to preserve locally.
+            await mappings.RemoveItemAsync(mapping.MappingId, rel, ct);
+            await RecordAsync(mapping, rel, "Conflict", "Resolved", "Conflict resolved: local copy no longer exists.", ct);
+            return;
+        }
+
+        var actual = await FindActualServerItemAsync(rootId, remoteRel, remote, ct);
+        if (actual is null)
+            throw new SyncApiException(System.Net.HttpStatusCode.NotFound, "SYNC_ITEM_NOT_FOUND",
+                $"Conflict unresolved: {rel} is no longer on Oryno NAS.");
+
+        var meta = await GetServerContentMetadataDetailedAsync(actual.ItemId, actual.Version, ct);
+        if (meta.Hash is null)
+        {
+            // Bounded retry: transient until it has been attempted a few times, then a precise terminal
+            // error that does NOT masquerade as a name conflict and does not overwrite anything.
+            var message = $"Server content hash unavailable for {rel} ({meta.ErrorCode}: {meta.ErrorMessage}). Conflict not verified, nothing was overwritten.";
+            if (op.AttemptCount >= 5)
+                throw new SyncApiException(System.Net.HttpStatusCode.Conflict, "SYNC_HASH_UNAVAILABLE", message);
+            throw new SyncApiException(System.Net.HttpStatusCode.ServiceUnavailable, "SYNC_HASH_UNAVAILABLE", message);
+        }
+
+        var localHash = await HashAsync(full, ct);
+        if (string.Equals(localHash, meta.Hash, StringComparison.OrdinalIgnoreCase))
+        {
+            var info = new FileInfo(full);
+            await mappings.UpsertItemAsync(new(mapping.MappingId, rel, ItemType.File, info.Length, info.LastWriteTimeUtc, SyncItemState.Synced), ct);
+            remote[remoteRel] = new RemoteItemState(actual.ItemId, rootId, actual.ParentItemId, actual.Name, remoteRel, actual.ItemType,
+                info.Length, actual.MtimeUtc, meta.Hash, actual.Version, 0, RemotePlanningState.MetadataOnly);
+            await RecordAsync(mapping, rel, "Conflict", "Resolved", "Conflict resolved: identical content (BLAKE3 match).", ct);
+            return;
+        }
+
+        throw new SyncApiException(System.Net.HttpStatusCode.Conflict, "SYNC_CONFLICT",
+            $"Conflict: {rel} differs locally ({Short(localHash)}) and on Oryno NAS ({Short(meta.Hash)}). Nothing was overwritten.");
+    }
+
+    private static string Short(string? hash) => string.IsNullOrEmpty(hash) ? "n/a" : hash[..Math.Min(8, hash.Length)];
 
     /// <summary>
     /// Section 9 fix: Update last successful file sync timestamp (per-mapping).
     /// </summary>
     private async Task UpdateLastSuccessfulFileSync(SyncMapping mapping, CancellationToken ct = default)
     {
-        await remoteState.RecordSuccessfulFileSyncForMappingAsync(mapping.MappingId, ct);
-        if (mapping.ServerRootId is Guid rootId)
+        // §13: a bookkeeping timestamp must never fail a transfer that already succeeded.
+        try
         {
-            await remoteState.RecordSuccessfulFileSyncAsync(rootId, ct);
+            await remoteState.RecordSuccessfulFileSyncForMappingAsync(mapping.MappingId, ct);
+            if (mapping.ServerRootId is Guid rootId)
+            {
+                await remoteState.RecordSuccessfulFileSyncAsync(rootId, ct);
+            }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+        catch (Exception ex)
+        {
+            LogDiagnosticDeduped("LAST_SUCCESSFUL_SYNC_WRITE_FAILED", mapping.MappingId,
+                ex.GetType().Name, ex.Message);
         }
     }
 
@@ -835,6 +1085,31 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
     private static string ConflictCopyPath(string path)
     {
         var directory = Path.GetDirectoryName(path)!; var stem = Path.GetFileNameWithoutExtension(path); var ext = Path.GetExtension(path); var candidate = Path.Combine(directory, $"{stem} (conflict Oryno {DateTime.Now:yyyyMMdd-HHmmss}){ext}"); var n = 2; while (File.Exists(candidate)) candidate = Path.Combine(directory, $"{stem} (conflict Oryno {DateTime.Now:yyyyMMdd-HHmmss}-{n++}){ext}"); return candidate;
+    }
+
+    /// <summary>
+    /// §0/§4: true, если conflict-копия этой версии серверного файла УЖЕ материализована на диске
+    /// (переживает рестарт процесса). Сравниваем по размеру серверного файла: копия создаётся
+    /// скачиванием серверной версии, поэтому совпадение размера = та же серверная версия.
+    /// </summary>
+    private static bool ConflictCopyMaterialized(string full, long remoteSize)
+    {
+        try
+        {
+            var directory = Path.GetDirectoryName(full);
+            if (string.IsNullOrEmpty(directory) || !Directory.Exists(directory)) return false;
+            var stem = Path.GetFileNameWithoutExtension(full); var ext = Path.GetExtension(full);
+            var prefix = stem + " (conflict Oryno ";
+            foreach (var candidate in Directory.EnumerateFiles(directory))
+            {
+                var name = Path.GetFileName(candidate);
+                if (!name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) continue;
+                if (!name.EndsWith(ext, StringComparison.OrdinalIgnoreCase)) continue;
+                try { if (new FileInfo(candidate).Length == remoteSize) return true; } catch { /* недоступный кандидат — игнорируем */ }
+            }
+        }
+        catch (Exception) { /* каталог недоступен — считаем, что копии нет */ }
+        return false;
     }
 
     private async Task<string> HashAsync(string path, CancellationToken ct) { await _hashGate.WaitAsync(ct); try { return await _hasher.ComputeAsync(path, ct); } finally { _hashGate.Release(); } }

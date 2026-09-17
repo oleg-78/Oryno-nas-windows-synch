@@ -46,6 +46,32 @@ public sealed class RemoteStateStore(string databasePath) : IRemoteStateStore
         CREATE TABLE IF NOT EXISTS sync_conflicts(conflict_id TEXT PRIMARY KEY,root_id TEXT NOT NULL,server_item_id TEXT,relative_path TEXT NOT NULL,conflict_type TEXT NOT NULL,created_at TEXT NOT NULL,resolved_at TEXT);
         """;
         await cmd.ExecuteNonQueryAsync(ct);
+        await EnsureColumnsAsync(c, "remote_sync_state", [("last_successful_file_sync", "TEXT")], ct);
+    }
+
+    /// <summary>
+    /// §13 fix: CREATE TABLE IF NOT EXISTS never adds a column to a database created by an older build.
+    /// The missing column made every completed transfer fail with
+    /// "SQLite Error 1: no such column: last_successful_file_sync" — the operation retried forever,
+    /// nothing was marked Synced and "Last successful file sync" stayed empty.
+    /// Repair the schema additively on every start.
+    /// </summary>
+    internal static async Task EnsureColumnsAsync(SqliteConnection c, string table, (string Column, string Type)[] columns, CancellationToken ct)
+    {
+        var existing = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        await using (var pragma = c.CreateCommand())
+        {
+            pragma.CommandText = $"PRAGMA table_info({table})";
+            await using var r = await pragma.ExecuteReaderAsync(ct);
+            while (await r.ReadAsync(ct)) existing.Add(r.GetString(1));
+        }
+        foreach (var (column, type) in columns)
+        {
+            if (existing.Contains(column)) continue;
+            await using var alter = c.CreateCommand();
+            alter.CommandText = $"ALTER TABLE {table} ADD COLUMN {column} {type}";
+            await alter.ExecuteNonQueryAsync(ct);
+        }
     }
 
     public async Task<RemoteRootState> GetRootStateAsync(Guid rootId, CancellationToken ct = default)

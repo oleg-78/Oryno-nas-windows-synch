@@ -458,9 +458,33 @@ public partial class MainWindow : Window
     private string? _lastActivityText;
     private int _lastActivityRepeatCount;
     private DateTimeOffset _lastActivityFirstSeen;
+    /// <summary>§0/§16: queue-level detail is internal bookkeeping, NOT a user sync event.
+    /// "<file> · Changed · Waiting" was written on every watcher/scan event (499 of the 500 stored
+    /// activity rows), which is exactly what the user read as an endless "Sync / Sync / Sync" list.
+    /// Real completions (Uploaded/Downloaded/Deleted/Moved/Created/Conflict/Failed) and the explicit
+    /// started/stopped notices are recorded by the coordinator and transfer events instead.</summary>
+    private static bool IsInternalActivity(string text) =>
+        // EndsWith("Waiting") keeps this independent of the middle-dot character used by the runtime.
+        text.EndsWith("Waiting", StringComparison.OrdinalIgnoreCase)
+        || text.Contains("· Waiting", StringComparison.OrdinalIgnoreCase)
+        || text.Contains("· Changed ·", StringComparison.OrdinalIgnoreCase)
+        || text.Contains("ambiguous paths", StringComparison.OrdinalIgnoreCase)
+        || text.Contains("Rebuild", StringComparison.OrdinalIgnoreCase)
+        || text.StartsWith("Skipped ", StringComparison.OrdinalIgnoreCase)
+        || text.StartsWith("File is busy", StringComparison.OrdinalIgnoreCase)
+        || text.StartsWith("Watcher overflow", StringComparison.OrdinalIgnoreCase);
+
+    private readonly HashSet<string> _internalActivityLogged = new(StringComparer.Ordinal);
+
     private void AddActivity(string text)
     {
         var now = DateTimeOffset.Now;
+        if (IsInternalActivity(text))
+        {
+            // §0: no Activity row and no UI row — diagnostics only, once per unique message per run.
+            if (_internalActivityLogged.Add(text)) DiagnosticsLogger.Write("SYNC_INTERNAL_ACTIVITY", text);
+            return;
+        }
         _ = _mappingStore.RecordActivityAsync(new SyncActivityEvent(Guid.NewGuid(), null, null, "Activity", "Indexed", now, null, text));
 
         // Deduplication: if same message repeats, show "Occurrences: N" instead of spamming UI
