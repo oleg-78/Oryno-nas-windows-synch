@@ -69,6 +69,11 @@ public partial class MainWindow : Window
         _remoteStore = new RemoteStateStore(DatabasePath);
         _mappingStore = new SqliteSyncMappingStore(DatabasePath);
         _mappingRuntime = new SyncMappingRuntimeManager(_mappingStore) { Wake = _wake, Suppression = _suppression };
+        // §11: wired here as well, because RestoreAsync() (which starts the mappings and their first full
+        // scan) runs *before* InitializeProductionClient() creates the transfer coordinator. The lambda is
+        // null-safe; the definitive wiring plus a fresh rescan happens once the client is fully initialised.
+        _mappingRuntime.ConsistencyReconcile = (mapping, token) =>
+            _transfer is null ? Task.CompletedTask : _transfer.RebuildAsync(mapping, token, verifyPhysical: true);
         // §1/§2/§6/§7: the status line has exactly one writer, and it only speaks when the visible text changes.
         _statusPresenter.Changed += OnUserStatusChanged;
         _mappingRuntime.Activity += (mapping, text) => { AddActivity($"{Path.GetFileName(mapping.LocalPath)} - {text}"); if (mapping.ServerRootId is null) DiagnosticsLogger.Write("FOLDER_BLOCKED", $"folder_id={mapping.MappingId} local_path={mapping.LocalPath} remote_root_id=none remote_path=none state=ServerRootUnavailable reason=NAS destination missing"); };
@@ -164,6 +169,14 @@ public partial class MainWindow : Window
         };
         _transfer = new MappingTransferCoordinator(_mappingStore, _remoteStore, _api, Path.Combine(_appData, "Transfers")) { Wake = _wake, Suppression = _suppression };
         _transfer.Activity += activity => Dispatcher.BeginInvoke(() => _activityVm.Add($"{activity.Timestamp.LocalDateTime:t}  {activity.RelativePath}  {activity.Action}"));
+        // §11 (recursive audit): a full scan must end with a real local↔remote consistency reconciliation —
+        // the watcher cannot see files that existed before it started and never changed again. It runs on
+        // start / overflow / explicit rescan only (never on the 60 s cadence) and verifies remote content
+        // physically before it decides that a local file needs no upload.
+        _mappingRuntime.ConsistencyReconcile = (mapping, token) => _transfer!.RebuildAsync(mapping, token, verifyPhysical: true);
+        // §11: the mappings were restored (and scanned once) before this coordinator existed, so ask every
+        // running mapping for one fresh full scan now — that scan ends with the consistency reconciliation.
+        _mappingRuntime.RequestRescan("consistency-ready");
     }
 
     private HttpClient CreateHttpClient(Uri uri, Func<string, CancellationToken, Task<string?>> reader)
@@ -391,7 +404,10 @@ public partial class MainWindow : Window
             HasMappings: mappings.Count > 0,
             AllMappingsStopped: mappings.Count > 0 && mappings.All(x => !x.Enabled),
             Paused: _paused,
-            WorkInProgress: _draining), reason);
+            WorkInProgress: _draining,
+            // §16 (recursive audit): a zero queue + zero errors is NOT proof that everything is on the NAS.
+            // The count of non-Synced tracking rows is the consistency half of the invariant.
+            UnsyncedLocalItems: _lastSummary.UnsyncedLocalCount), reason);
     }
 
     /// <summary>§6: fires only on a real visible change, so the subtitle does not flicker and stays a no-op otherwise.</summary>
@@ -450,7 +466,9 @@ public partial class MainWindow : Window
             _foldersVm.ApplySummaries(mappingSummaries);
             _foldersVm.Stats = $"{summary.IndexedFiles:N0} indexed · {summary.WaitingCount:N0} waiting · {summary.ErrorCount:N0} errors";
             _settingsVm.QueueLength = summary.WaitingCount.ToString("N0");
-            SidebarSyncText.Text = summary.WaitingCount == 0 ? "Everything is up to date" : $"{summary.WaitingCount:N0} changes waiting safely";
+            SidebarSyncText.Text = summary.UnsyncedLocalCount > 0
+            ? $"{summary.UnsyncedLocalCount:N0} file(s) not on NAS yet"
+            : summary.WaitingCount == 0 ? "Everything is up to date" : $"{summary.WaitingCount:N0} changes waiting safely";
         });
         // §1/§5: the subtitle is owned by the status presenter (one writer, stable while idle).
         _lastSummary = summary;
@@ -468,7 +486,7 @@ public partial class MainWindow : Window
         var before = await _mappingStore.GetDashboardSummaryAsync();
         var beforeBreakdown = await _mappingStore.GetQueueBreakdownAsync();
         var mappings = await _mappingStore.GetMappingsAsync();
-        var report = await ErrorReconcileRunner.ReconcileAsync(_mappingStore, _remoteStore, mappings, HashLocalAsync);
+        var report = await ErrorReconcileRunner.ReconcileAsync(_mappingStore, _remoteStore, mappings, HashLocalAsync, RemoteContentPresentAsync);
         var purged = await _mappingStore.PurgeStaleOperationsAsync();
         var after = await _mappingStore.GetDashboardSummaryAsync();
         var afterBreakdown = await _mappingStore.GetQueueBreakdownAsync();
@@ -486,6 +504,20 @@ public partial class MainWindow : Window
     {
         try { return await new Blake3ContentHasher().ComputeAsync(path, ct); }
         catch (Exception) { return null; }
+    }
+
+    /// <summary>
+    /// §19 (recursive audit): physical proof that the server can actually serve an item's content
+    /// (<c>HEAD /items/{id}/content</c>). Used to decide whether a remote row found only at a pre-fix
+    /// (legacy) path really means "already uploaded" — the index still carries phantom rows whose file is
+    /// gone, and trusting them is what silently closed thousands of operations.
+    /// </summary>
+    private async Task<bool> RemoteContentPresentAsync(RemoteItemState item, CancellationToken ct)
+    {
+        if (_api is null) return false;
+        try { await _api.GetContentMetadataAsync(item.ItemId, item.Version, ct); return true; }
+        catch (SyncApiException ex) when (ex.Code is "SYNC_CONTENT_MISSING" or "SYNC_ITEM_NOT_FOUND") { return false; }
+        catch (Exception) { return false; }
     }
 
     /// <summary>§18: manual retry for the files the user still sees as active problems.</summary>

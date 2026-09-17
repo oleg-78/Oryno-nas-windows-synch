@@ -300,12 +300,15 @@ SELECT (SELECT COUNT(*) FROM mapping_local_items WHERE item_type='File'),
 (SELECT COUNT(*) FROM mapping_pending_operations WHERE state IN ({ActiveErrorStatesSql})),
 (SELECT COUNT(*) FROM sync_mappings),
 (SELECT MAX(last_successful_file_sync) FROM sync_mappings WHERE last_successful_file_sync IS NOT NULL),
-(SELECT COUNT(*) FROM sync_error_history)
+(SELECT COUNT(*) FROM sync_error_history),
+(SELECT COUNT(*) FROM mapping_local_items WHERE sync_state IN ('Waiting','Uploading','Downloading','Conflict','Error'))
 """);
         await using var r=await cmd.ExecuteReaderAsync(ct);
         await r.ReadAsync(ct);
         // §10: the dashboard must show the real last successful file sync (was hardcoded null).
-        return new(r.GetInt32(0),r.GetInt32(1),r.GetInt32(2),r.GetInt32(3),r.IsDBNull(4)?null:DateTimeOffset.Parse(r.GetString(4)),r.GetInt32(5));
+        // §16 (audit invariant): UnsyncedLocalCount — local items whose remote counterpart is not confirmed.
+        // "Up to date" must never be derived from Pending == 0 && Errors == 0 alone.
+        return new(r.GetInt32(0),r.GetInt32(1),r.GetInt32(2),r.GetInt32(3),r.IsDBNull(4)?null:DateTimeOffset.Parse(r.GetString(4)),r.GetInt32(5),r.GetInt32(6));
     }
     public async Task<IReadOnlyList<SyncMappingSummary>> GetMappingSummariesAsync(CancellationToken ct=default)
     {
@@ -316,12 +319,13 @@ SELECT m.mapping_id,
 (SELECT COUNT(*) FROM mapping_pending_operations p WHERE p.mapping_id=m.mapping_id AND p.state IN ({LiveStatesSql})),
 (SELECT COUNT(*) FROM mapping_pending_operations p WHERE p.mapping_id=m.mapping_id AND p.state IN ({ActiveErrorStatesSql})),
 m.last_successful_file_sync,
-(SELECT COUNT(*) FROM sync_error_history h WHERE h.mapping_id=m.mapping_id)
+(SELECT COUNT(*) FROM sync_error_history h WHERE h.mapping_id=m.mapping_id),
+(SELECT COUNT(*) FROM mapping_local_items i WHERE i.mapping_id=m.mapping_id AND i.sync_state IN ('Waiting','Uploading','Downloading','Conflict','Error'))
 FROM sync_mappings m ORDER BY m.created_at
 """);
         await using var r=await cmd.ExecuteReaderAsync(ct);
         var result=new List<SyncMappingSummary>();
-        while(await r.ReadAsync(ct))result.Add(new(Guid.Parse(r.GetString(0)),r.GetInt32(1),r.GetInt32(2),r.GetInt32(3),r.IsDBNull(4)?null:DateTimeOffset.Parse(r.GetString(4)),r.GetInt32(5)));
+        while(await r.ReadAsync(ct))result.Add(new(Guid.Parse(r.GetString(0)),r.GetInt32(1),r.GetInt32(2),r.GetInt32(3),r.IsDBNull(4)?null:DateTimeOffset.Parse(r.GetString(4)),r.GetInt32(5),r.GetInt32(6)));
         return result;
     }
     public async Task<IReadOnlyList<SyncFileError>> GetErrorsAsync(int limit=50,CancellationToken ct=default)

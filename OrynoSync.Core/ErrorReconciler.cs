@@ -155,11 +155,13 @@ public static class ErrorReconcileRunner
         IRemoteStateStore remoteStore,
         IReadOnlyList<SyncMapping> mappings,
         Func<string, CancellationToken, Task<string?>>? hashLocal,
+        Func<RemoteItemState, CancellationToken, Task<bool>>? legacyContentProbe = null,
         CancellationToken ct = default)
     {
         var results = new List<ErrorReconcileResult>();
         var remotes = new Dictionary<Guid, Dictionary<string, RemoteItemState>>();
         var legacyLayoutMatches = 0;
+        var legacyUnverified = 0;
 
         foreach (var mapping in mappings)
         {
@@ -207,11 +209,24 @@ public static class ErrorReconcileRunner
                     // Pre-fix clients wrote items under the root without the destination prefix
                     // ("Ламинат\..." instead of "Работа\Ламинат\..."). The upload already happened there,
                     // so it must be recognised instead of being retried into a duplicate.
+                    // §19 (recursive audit): a metadata row is NOT proof. The index still carries thousands
+                    // of phantom rows from the historical wrong-parent defect (the server's own reconcile
+                    // aborted with `delete_storm_aborted` and never committed the deletes), and accepting
+                    // them silently closed every operation as "resolved" — that is what produced the false
+                    // "Everything is up to date" while ~3 000 files were missing on the NAS. So a legacy
+                    // match only counts when the server can actually serve its content.
                     var legacyKey = PathRules.NormalizeRelative(rel).Trim('\\');
                     if (remote.TryGetValue(legacyKey, out var legacyItem))
                     {
-                        remoteItem = legacyItem;
-                        atLegacyPath = true;
+                        if (legacyContentProbe is not null && await legacyContentProbe(legacyItem, ct))
+                        {
+                            remoteItem = legacyItem;
+                            atLegacyPath = true;
+                        }
+                        else
+                        {
+                            legacyUnverified++;
+                        }
                     }
                 }
 
@@ -239,7 +254,9 @@ public static class ErrorReconcileRunner
         foreach (var group in results.GroupBy(r => (r.Outcome, r.Reason)))
             SyncDiagnostics.Report("ERROR_RECONCILE", $"outcome={group.Key.Outcome} reason={group.Key.Reason} count={group.Count()}");
         if (legacyLayoutMatches > 0)
-            SyncDiagnostics.Report("LEGACY_REMOTE_LAYOUT", $"count={legacyLayoutMatches} note=remote items found outside the chosen destination (pre-fix layout); errors closed without re-uploading");
+            SyncDiagnostics.Report("LEGACY_REMOTE_LAYOUT", $"count={legacyLayoutMatches} note=remote items found outside the chosen destination (pre-fix layout), content verified present; errors closed without re-uploading");
+        if (legacyUnverified > 0)
+            SyncDiagnostics.Report("LEGACY_REMOTE_UNVERIFIED", $"count={legacyUnverified} note=remote metadata exists only at a pre-fix path and its content is NOT served; the operation stays queued for the authoritative upload into the chosen destination");
 
         foreach (var result in results.Where(r => r.Outcome is ErrorOutcome.Resolved or ErrorOutcome.StaleOrphan))
         {

@@ -860,8 +860,14 @@ public class AuditMockSyncApi : IContentTransferApi, ISyncMetadataApi
 
     public Task<(long Size, string Hash, DateTimeOffset? Mtime)> GetContentMetadataAsync(Guid itemId, long version, CancellationToken ct = default)
     {
+        // §19: the physical filesystem is the authority — a test can mark an item whose file is gone.
+        if (ContentMissing.Contains(itemId))
+            return Task.FromException<(long, string, DateTimeOffset?)>(new SyncApiException(HttpStatusCode.NotFound, "SYNC_CONTENT_MISSING", "content missing on storage"));
         return Task.FromResult((ExistingItemSize, ExistingItemHash, (DateTimeOffset?)DateTimeOffset.UtcNow));
     }
+
+    /// <summary>Item ids whose content cannot be served (phantom metadata rows).</summary>
+    public readonly HashSet<Guid> ContentMissing = new();
 }
 
 public class AuditMockRemoteStateStore : IRemoteStateStore

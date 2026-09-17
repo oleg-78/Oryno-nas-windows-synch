@@ -17,6 +17,14 @@ public sealed class SyncMappingRuntimeManager(ISyncMappingStore store) : IDispos
     public LocalMutationSuppression? Suppression { get; set; }
 
     /// <summary>
+    /// §11 (recursive audit): the full local↔remote consistency reconciliation, run once at the end of
+    /// every full scan (first Start, re-Start, watcher overflow, explicit rescan) — never on the 60 s
+    /// cadence. The app wires this to <c>MappingTransferCoordinator.RebuildAsync</c>, which verifies the
+    /// remote content physically before it concludes that a local file needs no upload.
+    /// </summary>
+    public Func<SyncMapping, CancellationToken, Task>? ConsistencyReconcile { get; set; }
+
+    /// <summary>
     /// §2/§13/§15: the persisted desired state decides what happens after a restart.
     /// Enabled=true → continuous sync resumes without any click; Enabled=false → it stays Stopped.
     /// </summary>
@@ -68,7 +76,8 @@ public sealed class SyncMappingRuntimeManager(ISyncMappingStore store) : IDispos
             text => Activity?.Invoke(mapping, text),
             progress => Progress?.Invoke(mapping, progress),
             Wake,
-            Suppression);
+            Suppression,
+            ConsistencyReconcile);
         _runtimes[mapping.MappingId] = runtime;
         if (mapping.Status is not MappingStatus.ReadyForPreflight and not MappingStatus.ReadyToSync and not MappingStatus.Stopped)
             await SetStatusAsync(mapping, MappingStatus.Scanning, null, ct);
@@ -158,6 +167,7 @@ public sealed class SyncMappingRuntimeManager(ISyncMappingStore store) : IDispos
         private readonly List<MappingPendingOperation> _batchOperations = new(100);
         private readonly SyncWakeSignal? _wake;
         private readonly LocalMutationSuppression? _suppression;
+        private readonly Func<SyncMapping, CancellationToken, Task>? _consistency;
         private readonly IgnoreRules _ignores = new();
         private string _scanReason = "request";
         private bool _disposed;
@@ -165,7 +175,8 @@ public sealed class SyncMappingRuntimeManager(ISyncMappingStore store) : IDispos
         public bool Paused { get; set; }
 
         public Runtime(SyncMapping mapping, ISyncMappingStore store, Action<string> activity, Action<ScanProgress> progress,
-            SyncWakeSignal? wake = null, LocalMutationSuppression? suppression = null)
+            SyncWakeSignal? wake = null, LocalMutationSuppression? suppression = null,
+            Func<SyncMapping, CancellationToken, Task>? consistency = null)
         {
             _mapping = mapping;
             _store = store;
@@ -173,6 +184,7 @@ public sealed class SyncMappingRuntimeManager(ISyncMappingStore store) : IDispos
             _progress = progress;
             _wake = wake;
             _suppression = suppression;
+            _consistency = consistency;
             _watcher = new FileSystemWatcher(mapping.LocalPath)
             {
                 IncludeSubdirectories = true,
@@ -293,6 +305,30 @@ public sealed class SyncMappingRuntimeManager(ISyncMappingStore store) : IDispos
                             : MappingStatus.Syncing;
                 await UpdateStatusAsync(finalStatus, null, ct);
                 _progress(new ScanProgress(files, folders, changes, true));
+
+                // §11 (recursive audit): a FileSystemWatcher only reports changes that happen *while it
+                // runs*. Files that were already on disk before the watcher started and never changed again
+                // are invisible to it — that is exactly how the local tree could drift from the NAS while
+                // the UI stayed on "Everything is up to date". So every full scan (start, re-start,
+                // overflow, explicit rescan — never the 60 s cadence) ends with a real local↔remote
+                // consistency reconciliation. It re-derives the tracking states and queues CreateFile for
+                // every non-ignored local item that has no verified remote counterpart.
+                if (_consistency is not null && !Paused)
+                {
+                    try
+                    {
+                        SyncDiagnostics.Report("CONSISTENCY_SCAN", $"mapping={_mapping.MappingId} reason={_scanReason} action=start");
+                        await _consistency(_mapping, ct);
+                        // §4: the reconciliation queued real work — drain it now instead of waiting for the poll.
+                        _wake?.Pulse();
+                        SyncDiagnostics.Report("CONSISTENCY_SCAN", $"mapping={_mapping.MappingId} reason={_scanReason} action=done");
+                    }
+                    catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
+                    catch (Exception ex)
+                    {
+                        SyncDiagnostics.Report("CONSISTENCY_SCAN", $"mapping={_mapping.MappingId} reason={_scanReason} action=failed error={ex.GetType().Name}: {ex.Message}");
+                    }
+                }
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
             catch (Exception ex)

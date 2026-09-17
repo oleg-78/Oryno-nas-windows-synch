@@ -114,13 +114,60 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
         if (mapping.ServerRootId is Guid rootId) await remoteState.RemoveRootStateAsync(rootId, ct);
     }
 
-    public async Task<QueueNormalizationResult> RebuildAsync(SyncMapping mapping, CancellationToken ct = default)
+    /// <summary>
+    /// §11/§19 (recursive audit): the one-shot full consistency reconciliation — local tree vs remote tree.
+    /// It is NOT part of the 60 s cadence (see SyncMappingRuntime): it runs on first Start, after an
+    /// upgrade/migration, after a watcher overflow and on an explicit repair.
+    /// <para>
+    /// <paramref name="verifyPhysical"/>: before planning, every in-scope remote *file* item is probed on
+    /// the server (<c>HEAD /items/{id}/content</c>). The physical filesystem is the authority: a metadata
+    /// row whose content cannot be served is a phantom (the historical wrong-parent/prefix defect, still
+    /// served by the index after the aborted delete-storm) and must not make the client believe a local
+    /// file is already synced — that produced the false "Up to date" while ~3 000 files were missing.
+    /// </para>
+    /// </summary>
+    public async Task<QueueNormalizationResult> RebuildAsync(SyncMapping mapping, CancellationToken ct = default, bool verifyPhysical = true)
     {
         if (mapping.ServerRootId is not Guid rootId) throw new InvalidOperationException("Select an Oryno NAS folder before rebuilding sync state.");
+
+        // §11/§19: plan against the *current* server inventory, not against a cache that lags the uploads of
+        // the last minutes — otherwise a pass right after a restart re-queues files that are already on the
+        // NAS (observed: a complete second upload pass of ~3 000 files). Best effort: if the refresh fails the
+        // pass still runs on the cached inventory.
+        if (api is ISyncMetadataApi metadata)
+        {
+            try
+            {
+                var fresh = new List<RemoteItemDto>();
+                string? cursor = null;
+                var pages = 0;
+                for (var pageIndex = 0; pageIndex < 200; pageIndex++)
+                {
+                    var page = await metadata.GetInventoryPageAsync(rootId, cursor, 500, ct);
+                    pages++;
+                    fresh.AddRange(page.Items);
+                    cursor = page.NextCursor;
+                    if (string.IsNullOrEmpty(cursor) || page.Items.Count == 0) break;
+                }
+                if (fresh.Count > 0)
+                    await remoteState.RefreshFromServerAsync(rootId, (_, _) => Task.FromResult<IReadOnlyList<RemoteItemDto>>(fresh), ct);
+                // §0: internal reconciliation step — diagnostic only, never a user-facing activity row.
+                LogDiagnosticDeduped("CONSISTENCY_INVENTORY_REFRESH", mapping.MappingId, "", $"items={fresh.Count} pages={pages}");
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+            catch (Exception ex)
+            {
+                LogDiagnosticDeduped("CONSISTENCY_INVENTORY_REFRESH", mapping.MappingId, "", $"failed error={ex.GetType().Name} action=use_cached_inventory");
+            }
+        }
+
         var remoteItems = (await remoteState.GetRemoteItemsAsync(rootId, ct))
             .Where(x => !x.IsDeleted && mapping.InDestination(x.RelativePath))
             .Select(x => { var l = mapping.ToLocalRel(x.RelativePath); return l is null ? null : x with { RelativePath = l }; })
             .Where(x => x is not null).Select(x => x!).ToArray();
+        
+        var phantomDropped = 0;
+        if (verifyPhysical) remoteItems = await VerifyRemoteContentAsync(mapping, remoteItems, ct, count => phantomDropped = count);
         
         // Section C: Authoritative duplicate resolution instead of GroupBy.First
         var remoteResolution = DuplicateCanonicalResolver.ResolveRemote(remoteItems,
@@ -175,7 +222,16 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
                 LogDiagnosticDeduped("REBUILD_CANONICAL_COLLISION", mapping.MappingId, group.Key, ids);
             }
         }
-        var items = desired.Select(item => new MappingLocalItem(mapping.MappingId, item.RelativePath, item.ItemType, item.Size, item.Mtime, item.ItemType == ItemType.File && remoteByPath.TryGetValue(item.RelativePath, out var r) && string.Equals(item.ContentHash, r.ContentHash, StringComparison.OrdinalIgnoreCase) ? SyncItemState.Synced : SyncItemState.Waiting)).ToArray();
+        // §16: a directory is Synced as soon as the destination holds a directory item at the same path
+        // (folders have no content to hash, and the files inside re-create the chain anyway), while a file
+        // needs a *verified* remote item with a matching content hash. Previously every directory stayed
+        // Waiting forever, so the consistency count could never reach zero and "Up to date" was unreachable.
+        var items = desired.Select(item => new MappingLocalItem(mapping.MappingId, item.RelativePath, item.ItemType, item.Size, item.Mtime,
+            item.ItemType == ItemType.Directory
+                ? (remoteByPath.ContainsKey(item.RelativePath) ? SyncItemState.Synced : SyncItemState.Waiting)
+                : (remoteByPath.TryGetValue(item.RelativePath, out var remoteMatch) && string.Equals(item.ContentHash, remoteMatch.ContentHash, StringComparison.OrdinalIgnoreCase)
+                    ? SyncItemState.Synced
+                    : SyncItemState.Waiting))).ToArray();
         // §1/§5: a full rebuild used to drop every tracking row, which erased the local delete intents and
         // let the file be downloaded again on the next poll. Tombstones survive the rebuild.
         var tombstonedPaths = desired.Select(x => PathRules.NormalizeRelative(x.RelativePath)).ToHashSet(StringComparer.OrdinalIgnoreCase);
@@ -189,8 +245,83 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
         }
         await mappings.ReplaceItemsAsync(mapping.MappingId, items, ct);
         await mappings.ReplacePendingAsync(mapping.MappingId, normalized, ct);
-        await mappings.UpdateMappingAsync(mapping with { InventoryState = "Normalized", Status = normalized.Count == 0 ? MappingStatus.UpToDate : MappingStatus.ReadyToSync, UpdatedAt = DateTimeOffset.UtcNow }, ct);
+        // §11: the reconciliation just queued this work itself, so the engine must run it — the executor
+        // skips a mapping that sits in ReadyToSync/ReadyForPreflight (it used to wait for the startup
+        // restore to flip the status, which never happens for a reconciliation that runs *after* restore).
+        var nextStatus = normalized.Count == 0 ? MappingStatus.UpToDate : MappingStatus.Syncing;
+        await mappings.UpdateMappingAsync(mapping with { InventoryState = "Normalized", Status = nextStatus, UpdatedAt = DateTimeOffset.UtcNow }, ct);
+        // §19: one line that makes this audit reproducible from the support log.
+        LogDiagnosticDeduped("CONSISTENCY_RESULT", mapping.MappingId, "",
+            $"local={desired.Count} remote_in_scope={remote.Count} remote_phantom_dropped={phantomDropped} " +
+            $"synced={items.Count(x => x.SyncState == SyncItemState.Synced)} unsynced={items.Count(x => x.SyncState is not (SyncItemState.Synced or SyncItemState.DeletedLocal))} " +
+            $"plan_ops={plan.Operations.Count} plan_conflicts={plan.Conflicts.Count} verify_physical={verifyPhysical.ToString().ToLowerInvariant()}");
         return plan;
+    }
+
+    /// <summary>
+    /// §19 (recursive audit): HEAD-probe every in-scope remote file item and drop the ones the server
+    /// cannot actually serve. Directories are kept (they have no content); a file that fails for any
+    /// reason other than "content missing" is KEPT — a transport hiccup must never be turned into
+    /// "the file does not exist" and trigger a duplicate upload of the whole tree.
+    /// </summary>
+    private async Task<RemoteItemState[]> VerifyRemoteContentAsync(SyncMapping mapping, RemoteItemState[] items, CancellationToken ct, Action<int> reportDropped)
+    {
+        var served = new bool[items.Length];
+        var deferred = new string?[items.Length];
+        var gate = new SemaphoreSlim(6);
+        var tasks = items.Select(async (item, index) =>
+        {
+            if (!string.Equals(item.ItemType, "file", StringComparison.OrdinalIgnoreCase) || item.ItemId == Guid.Empty)
+            {
+                served[index] = true;
+                return;
+            }
+            await gate.WaitAsync(ct);
+            try
+            {
+                await api.GetContentMetadataAsync(item.ItemId, item.Version, ct);
+                served[index] = true;
+            }
+            catch (SyncApiException ex) when (ex.Code is "SYNC_CONTENT_MISSING" or "SYNC_ITEM_NOT_FOUND")
+            {
+                served[index] = false;
+                deferred[index] = ex.Code;
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                // Unavailable/unknown: keep the item, never mass-requeue on a transport hiccup.
+                served[index] = true;
+                deferred[index] = $"deferred:{ex.GetType().Name}";
+            }
+            finally { gate.Release(); }
+        });
+        await Task.WhenAll(tasks);
+
+        // Diagnostics and cache writes happen sequentially: the DiagnosticLog handlers (UI view-model, sqlite
+        // writes) are not built for six concurrent callers.
+        var kept = new List<RemoteItemState>(items.Length);
+        var dropped = 0;
+        for (var i = 0; i < items.Length; i++)
+        {
+            var item = items[i];
+            if (served[i])
+            {
+                if (deferred[i] is { } why)
+                    LogDiagnosticDeduped("REBUILD_VERIFY_DEFERRED", mapping.MappingId, item.RelativePath, $"item={item.ItemId:N} error={why} action=kept");
+                kept.Add(item);
+                continue;
+            }
+            dropped++;
+            LogDiagnosticDeduped("REBUILD_REMOTE_PHANTOM", mapping.MappingId, item.RelativePath, $"item={item.ItemId:N} code={deferred[i]} action=dropped_from_plan");
+            if (mapping.ServerRootId is Guid phantomRoot)
+            {
+                try { await remoteState.MarkItemMissingAsync(phantomRoot, item.ItemId.ToString(), ct); }
+                catch (Exception markEx) { SyncDiagnostics.Report("REBUILD_REMOTE_PHANTOM", $"mark_failed item={item.ItemId:N} error={markEx.GetType().Name}"); }
+            }
+        }
+        reportDropped(dropped);
+        return kept.ToArray();
     }
 
     public async Task ProcessAsync(IReadOnlyList<SyncMapping> allMappings, CancellationToken ct = default)
@@ -1283,15 +1414,21 @@ public sealed class MappingTransferCoordinator(ISyncMappingStore mappings, IRemo
 internal sealed class DuplicateDiagnosticDedup
 {
     private readonly Dictionary<(Guid, string), string> _lastSeen = new();
+    private readonly object _gate = new();
 
     public bool ShouldLog(Guid mappingId, string path, string ids)
     {
         var key = (mappingId, path);
-        if (_lastSeen.TryGetValue(key, out var lastIds) && lastIds == ids)
+        // §19: the consistency verification probes remote items concurrently, so this table is reached from
+        // several threads — a plain Dictionary corrupted itself ("non-concurrent collections" crash).
+        lock (_gate)
         {
-            return false; // Same duplicate set — don't spam
+            if (_lastSeen.TryGetValue(key, out var lastIds) && lastIds == ids)
+            {
+                return false; // Same duplicate set — don't spam
+            }
+            _lastSeen[key] = ids;
+            return true;
         }
-        _lastSeen[key] = ids;
-        return true;
     }
 }

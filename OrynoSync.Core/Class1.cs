@@ -28,8 +28,8 @@ public sealed record LocalItem(string RelativePath, ItemType ItemType, long Size
 public sealed record PendingOperation(Guid OperationId, OperationType Type, string RelativePath, string? SecondaryPath = null, DateTimeOffset? CreatedAt = null, int AttemptCount = 0, DateTimeOffset? NextAttemptAt = null, OperationState State = OperationState.Pending, string? LastError = null);
 public sealed record ActivityEntry(string RelativePath, string Action, string Status, DateTimeOffset Timestamp, string? Error = null);
 public sealed record ScanProgress(int FilesFound, int FoldersFound, int ChangesIndexed, bool IsComplete = false);
-public sealed record SyncDashboardSummary(int IndexedFiles, int WaitingCount, int ErrorCount, int FolderCount, DateTimeOffset? LastSuccessfulFileSync, int HistoricalErrorCount = 0);
-public sealed record SyncMappingSummary(Guid MappingId, int IndexedFiles, int WaitingCount, int ErrorCount, DateTimeOffset? LastSuccessfulFileSync, int HistoricalErrorCount = 0);
+public sealed record SyncDashboardSummary(int IndexedFiles, int WaitingCount, int ErrorCount, int FolderCount, DateTimeOffset? LastSuccessfulFileSync, int HistoricalErrorCount = 0, int UnsyncedLocalCount = 0);
+public sealed record SyncMappingSummary(Guid MappingId, int IndexedFiles, int WaitingCount, int ErrorCount, DateTimeOffset? LastSuccessfulFileSync, int HistoricalErrorCount = 0, int UnsyncedLocalCount = 0);
 public sealed record SyncActivityEvent(Guid EventId, Guid? MappingId, string? RelativePath, string Action, string Status, DateTimeOffset Timestamp, string? ErrorCode = null, string? ErrorMessage = null);
 public sealed record SyncFileError(Guid OperationId, Guid MappingId, string RelativePath, string Operation, string ErrorCode, string UserMessage, string? TechnicalMessage, int AttemptCount, DateTimeOffset LastAttemptAt, string State = "Failed", ErrorLifecycle Lifecycle = ErrorLifecycle.Active);
 
@@ -69,6 +69,17 @@ public static class PathRules
     public static string ToRelative(string root, string fullPath) => NormalizeRelative(Path.GetRelativePath(root, fullPath));
     public static string ToAbsolute(string root, string relativePath) => Path.GetFullPath(Path.Combine(root, NormalizeRelative(relativePath)));
     public static bool IsCaseCollision(IEnumerable<string> paths) => paths.GroupBy(p => NormalizeRelative(p), StringComparer.OrdinalIgnoreCase).Any(g => g.Count() > 1);
+    /// <summary>
+    /// §9 (recursive audit): the historical "double prefix" defect wrote a whole tree under a literal
+    /// <c>files\</c> component inside the mapping root (e.g. <c>E:\Работа\files\Ламинат\...</c>). Such a
+    /// subtree is never user data — every operation on it was archived as an orphan on each start — so it
+    /// must not enter the sync plan at all.
+    /// </summary>
+    public static bool IsLegacyPrefixPath(string relativePath)
+    {
+        var rel = NormalizeRelative(relativePath);
+        return rel.Equals("files", StringComparison.OrdinalIgnoreCase) || rel.StartsWith("files\\", StringComparison.OrdinalIgnoreCase);
+    }
     public static bool IsWindowsCompatible(string relativePath)
     {
         foreach (var part in NormalizeRelative(relativePath).Split('\\')) { if (string.IsNullOrWhiteSpace(part) || part.EndsWith(' ') || part.EndsWith('.') || part.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0) return false; var stem = Path.GetFileNameWithoutExtension(part).TrimEnd('.').ToUpperInvariant(); if (new[] { "CON", "PRN", "AUX", "NUL" }.Contains(stem) || (stem.Length == 4 && (stem.StartsWith("COM") || stem.StartsWith("LPT")) && char.IsDigit(stem[3]))) return false; }
@@ -99,6 +110,8 @@ public sealed class IgnoreRules(IEnumerable<string>? patterns = null)
     {
         var rel = PathRules.NormalizeRelative(relativePath);
         if (rel.Length == 0) return false;
+        // §9: the historical `files\...` subtree inside a mapping root is never user data.
+        if (PathRules.IsLegacyPrefixPath(rel)) return true;
         foreach (var part in rel.Split('\\'))
         {
             if (part.Length == 0) continue;

@@ -33,7 +33,12 @@ public sealed record SyncStatusInput(
     bool AllMappingsStopped = false,
     bool Paused = false,
     // Set while the loop is actually executing queued work (a drain pass); never set by merely starting a poll.
-    bool WorkInProgress = false);
+    bool WorkInProgress = false,
+    // §16 (audit invariant): tracking rows that are NOT Synced — a local file/dir that has no verified
+    // counterpart on the NAS. "Up to date" is forbidden while this is non-zero, because Pending == 0 &&
+    // Errors == 0 alone can be a false positive (queue rows can be dropped/reconciled away while the
+    // physical counterpart is missing).
+    int UnsyncedLocalItems = 0);
 
 /// <summary>
 /// §1/§3/§6/§7/§8: single writer for the user-visible status. It resolves the input to one of the seven
@@ -102,6 +107,9 @@ public sealed class SyncUserStatusPresenter
         if (!i.HasMappings) return (SyncUserStatus.Stopped, NoFoldersText, false);
         if (i.AllMappingsStopped) return (SyncUserStatus.Stopped, StoppedText, false);
         if (i.PendingOperations > 0 || i.ActiveTransfers > 0 || i.RemoteChangesApplied || i.WorkInProgress) return (SyncUserStatus.Syncing, SyncingText, false);
+        // §16: real work is done, but the audit still sees local items without a verified remote counterpart.
+        // Claiming "Up to date" here is exactly the observed false positive.
+        if (i.UnsyncedLocalItems > 0) return (SyncUserStatus.SyncIssues, $"{i.UnsyncedLocalItems:N0} file(s) missing on NAS", false);
         return (SyncUserStatus.UpToDate, UpToDateText, false);
     }
 }
